@@ -13,6 +13,7 @@ Trace timestamps are in microseconds (Chrome Trace Format standard); the input
 CSV column labelled avg_time_ms actually holds microsecond values.
 """
 
+import ast
 import csv
 import os
 
@@ -42,117 +43,159 @@ RIDGE_HBM_MXFP4 = PEAK_MXFP4_TFLOPS * 1e3 / PEAK_HBM_BW_GBs   # 1262.5
 RIDGE_IC_BF16 = PEAK_BF16_TFLOPS * 1e3 / PEAK_IC_BW_GBs         # 104.2
 RIDGE_IC_MXFP4 = PEAK_MXFP4_TFLOPS * 1e3 / PEAK_IC_BW_GBs      # 420.8
 
-B = 4096
 AVG_SEQ_LEN = 1024
+
+
+# ── Shape parsing ────────────────────────────────────────────────────────────
+
+def parse_shape(shape_str):
+    """Parse an Input Dims string like '[[4096, 2880], [640, 2880], ...]'."""
+    if not shape_str:
+        return None
+    try:
+        return ast.literal_eval(shape_str)
+    except (ValueError, SyntaxError):
+        return None
 
 
 # ── FLOP / byte estimation per kernel ───────────────────────────────────────
 
-def compute_flops_bytes(short_name, full_name, model_layer):
-    """Return (flops, bytes, precision, cache_level) or None."""
+def compute_flops_bytes(short_name, full_name, model_layer, shape_str):
+    """Return (flops, bytes, precision, cache_level) or None.
+
+    All tensor dimensions are extracted from *shape_str* (the Input Dims column
+    produced by generate_kernel_csv.py).  Returns None when shape data is
+    unavailable or the kernel is a communication / memcopy op.
+    """
+    if model_layer in ("nccl-allreduce", "output-allgather", "memcopy"):
+        return None
+
+    dims = parse_shape(shape_str)
+    if dims is None:
+        return None
+
+    try:
+        return _compute_flops_bytes_inner(short_name, dims)
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _extract_gemm_dims(dims):
+    """Return (M, K, N) from a GEMM shape, regardless of CPU-op format.
+
+    Handles three layouts:
+      aiter::gemm_a16w16 : [[M, K], [N, K], [bias], ...]   (transposed B)
+      aten::addmm        : [[bias], [M, K], [K, N], ...]   (bias first)
+      aten::matmul       : [[M, K], [K, N]]                (no bias)
+    """
+    if len(dims[0]) == 1 and len(dims) >= 3 and len(dims[1]) == 2:
+        M, K = dims[1]
+        N = dims[2][1]
+        return M, K, N
+    if len(dims) >= 2 and len(dims[0]) == 2 and len(dims[1]) == 2:
+        M, K = dims[0]
+        if dims[1][0] == K:
+            N = dims[1][1]
+        else:
+            N = dims[1][0]
+        return M, K, N
+    raise ValueError(f"Unrecognized GEMM shape: {dims}")
+
+
+def _compute_flops_bytes_inner(short_name, dims):
+    """Dispatch to per-kernel FLOP/byte estimation using parsed shape dims."""
 
     # ── BF16 GEMM kernels ────────────────────────────────────────────────────
-    if short_name == "Cijk GEMM (QKV decode)":
-        M, K, N = 4096, 2880, 640
+    # Two shape formats depending on which CPU op the trace links:
+    #   aiter::gemm_a16w16 → [[M, K], [N, K], [bias], ...]
+    #   aten::addmm        → [[bias], [M, K], [K, N], ...]
+    #   aten::matmul        → [[M, K], [K, N]]
+    if short_name in ("Cijk GEMM (QKV decode)",
+                      "Cijk GEMM (O-proj decode)",
+                      "Cijk GEMM (LM head prefill)",
+                      "bf16gemm (gating GEMM)"):
+        M, K, N = _extract_gemm_dims(dims)
         flops = 2 * M * K * N
-        byt = (M * K + N * K + M * N) * 2  # ~32.5 MB, fits in IC
-        return flops, byt, "bf16", "ic"
-
-    if short_name == "Cijk GEMM (O-proj decode)":
-        M, K, N = 4096, 512, 2880
-        flops = 2 * M * K * N
-        byt = (M * K + N * K + M * N) * 2  # ~30.7 MB, fits in IC
-        return flops, byt, "bf16", "ic"
-
-    if short_name == "bf16gemm (gating GEMM)":
-        M, K, N = 4096, 2880, 128
-        flops = 2 * M * K * N
-        byt = (M * K + N * K + M * N) * 2  # ~25.4 MB, fits in IC
-        return flops, byt, "bf16", "ic"
-
-    if short_name == "Cijk GEMM (LM head prefill)":
-        M, K, N = 4, 2880, 25136
-        flops = 2 * M * K * N
-        byt = (M * K + N * K + M * N) * 2  # ~145 MB, fits in IC
+        byt = (M * K + N * K + M * N) * 2
         return flops, byt, "bf16", "ic"
 
     # ── MXFP4 MoE GEMM kernels ──────────────────────────────────────────────
+    # gate+up shape: [[B, K_in], [experts, N_out, K_packed], [B, topk, out_dim],
+    #                  [dispatched], ..., [act_scale], [wt_scale], [smooth], ...]
     if short_name == "MoeFlatmm (gate+up SwiGLU)":
-        dispatched = 20476
-        K_in, N_out = 3072, 1024
+        K_in = dims[0][1]
+        num_experts, N_out, K_packed = dims[1]
+        out_dim = dims[2][2]
+        dispatched = dims[3][0]
         flops = 2 * dispatched * K_in * N_out
         act_bytes = dispatched * K_in * 2
-        wt_bytes = 128 * N_out * (K_in // 2)
-        scale_bytes = 131072 * 96 + 20476 * 96 + 128 * 1024 * 4
-        out_bytes = dispatched * (N_out // 2) * 2
+        wt_bytes = num_experts * N_out * K_packed
+        scale_bytes = (dims[11][0] * dims[11][1]       # weight scales (e8m0)
+                       + dims[10][0] * dims[10][1]     # activation scales (e8m0)
+                       + dims[12][0] * dims[12][1] * 4)  # smooth factors (FP32)
+        out_bytes = dispatched * out_dim * 2
         byt = act_bytes + wt_bytes + scale_bytes + out_bytes
-        # Total ~363 MB exceeds IC, but kernel tiles through experts;
-        # weights (~201 MB FP4) stay resident in IC across iterations.
         return flops, byt, "mxfp4", "ic"
 
+    # down-proj shape: [[B, topk, K_in], [experts, N_out, K_packed], [B, N_out],
+    #                    [dispatched], ..., [act_scale], [wt_scale], [smooth], ...]
     if short_name == "MoeFlatmm (down proj)":
-        dispatched = 20476
-        K_in, N_out = 512, 3072
+        K_in = dims[0][2]
+        num_experts, N_out, K_packed = dims[1]
+        B_out = dims[2][0]
+        dispatched = dims[3][0]
         flops = 2 * dispatched * K_in * N_out
         act_bytes = dispatched * K_in * 2
-        wt_bytes = 128 * N_out * (K_in // 2)
-        scale_bytes = 20476 * 96 + 393216 * 16 + 128 * 3072 * 4
-        out_bytes = B * N_out * 2
+        wt_bytes = num_experts * N_out * K_packed
+        scale_bytes = (dims[10][0] * dims[10][1]
+                       + dims[11][0] * dims[11][1]
+                       + dims[12][0] * dims[12][1] * 4)
+        out_bytes = B_out * N_out * 2
         byt = act_bytes + wt_bytes + scale_bytes + out_bytes
-        return flops, byt, "mxfp4", "ic"  # ~157 MB, fits in IC
+        return flops, byt, "mxfp4", "ic"
 
     # ── Elementwise / memory-bound kernels ───────────────────────────────────
+    # rmsnorm shape: [[B, H], [B, H], [B, H], [B, H], [H], []]
     if "add_rmsnorm_quant" in short_name:
-        H = 2880
+        B, H = dims[0]
+        n_groups = max(H // 90, 1)
         flops = 5 * B * H
-        byt = (2 * B * H) * 2 + H * 2 + (2 * B * H) * 2 + B * H + B * 32 * 4
-        return flops, byt, "bf16", "ic"  # ~107 MB, fits in IC
+        byt = (2 * B * H) * 2 + H * 2 + (2 * B * H) * 2 + B * H + B * n_groups * 4
+        return flops, byt, "bf16", "ic"
 
-    if short_name == "fused_qk_rope_reshape_and_cache":
-        q_dim, k_dim = 640, 64
-        flops = 6 * B * (q_dim + k_dim)
-        byt = (2 * B * q_dim + 4 * B * k_dim) * 2
-        return flops, byt, "bf16", "ic"  # ~12.6 MB
-
-
-    if short_name == "paged_attention_ps_reduce":
-        flops = B * 512 * 2 * 2
-        byt = B * 512 * 2 * 4
-        return flops, byt, "bf16", "ic"  # ~16.8 MB
-
+    # topk gating shape: [[B, topk], [B, topk], [B, topk], [B, experts], ...]
     if short_name == "topkGatingSoftmax":
-        flops = B * 128 * 5
-        byt = B * 128 * 2 + B * 4 * (4 + 4)
+        B = dims[0][0]
+        topk = dims[0][1]
+        num_experts = dims[3][1]
+        flops = B * num_experts * 5
+        byt = B * num_experts * 2 + B * topk * (4 + 4)
         return flops, byt, "bf16", "ic"
 
-    if short_name == "triton_fused_pad_moe":
-        flops = B * 3072
-        byt = 2 * B * 3072 * 2
-        return flops, byt, "bf16", "ic"
-
+    # sorting shape: [[B, topk], [B, topk], ..., [B, hidden], ...]
     if short_name == "MoeSortingKernel":
-        flops = B * 4 * 10
-        byt = B * 3072 * 2 + B * 4 * 8
+        B = dims[0][0]
+        topk = dims[0][1]
+        hidden = dims[6][1]
+        flops = B * topk * 10
+        byt = B * hidden * 2 + B * topk * 8
         return flops, byt, "bf16", "ic"
 
+    # embedding shape: [[B], [vocab, H], ...]
     if short_name == "masked_embedding":
+        B = dims[0][0]
+        H = dims[1][1]
         flops = 0
-        byt = B * 2880 * 2
+        byt = B * H * 2
         return flops, byt, "bf16", "ic"
 
-    if short_name == "kv_indices_generate":
-        flops = B * 10
-        byt = B * 8 * 2
-        return flops, byt, "bf16", "ic"
-
+    # sampling shape: [[bs], [bs, vocab], [bs, vocab], [bs], ...]
     if short_name == "mix_sample_outer_exponential":
-        vocab, bs = 201088, 4
+        bs = dims[0][0]
+        vocab = dims[1][1]
         flops = bs * vocab * 5
         byt = bs * vocab * (2 + 4 + 4) + bs * 4
         return flops, byt, "bf16", "ic"
-
-    if model_layer in ("nccl-allreduce", "output-allgather", "memcopy"):
-        return None
 
     return None
 
@@ -188,7 +231,8 @@ def main():
         full = row["kernel_full_name"]
         avg_us = float(row["avg_time_ms"])
 
-        ret = compute_flops_bytes(short, full, layer)
+        shape = row.get("shape (Input Dims)", "")
+        ret = compute_flops_bytes(short, full, layer, shape)
         if ret is None:
             results.append({
                 "model_layer": layer,
@@ -318,8 +362,8 @@ def main():
         "MoeFlatmm (down proj)":           (0.3, 0.5),
         "add_rmsnorm_quant (decode)":      (1.4, 1.3),
         "fused_qk_rope_reshape_and_cache": (1.5, 1.4),
-        "paged_attention_decode":          (1.4, 0.6),
-        "paged_attention_ps_reduce":       (0.3, 0.5),
+        "sliding_window_attention":        (1.4, 0.6),
+        "attention_reduce":                (0.3, 0.5),
         "topkGatingSoftmax":               (1.3, 1.5),
         "triton_fused_pad_moe":            (0.3, 1.5),
         "MoeSortingKernel":                (1.3, 1.4),
