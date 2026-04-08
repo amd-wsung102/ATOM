@@ -1,0 +1,313 @@
+# Kernel-to-Layer mapping rules for GPT-OSS 120B (36 layers)
+# Patterns are matched top-to-bottom; first match wins.
+#
+# NVIDIA: "layers" section — each pattern is a Python regex on the demangled kernel name.
+# AMD:    "amd_gpu_kernel_rules" — substring match_all conditions on the GPU kernel name.
+#         "amd_cpu_op_rules"     — fallback classification by CPU operator name.
+
+model: "GPT-OSS 120B"
+
+layer_order:
+  - embedding
+  - "rmsnorm+shortcut (pre-attention)"
+  - qkv-projection
+  - "qk rope + kvcache"
+  - attention
+  - o-project
+  - nccl-allreduce
+  - "rmsnorm+shortcut (pre-MoE)"
+  - gating
+  - quant/sort
+  - moe-stage-1
+  - moe-stage-2
+  - lm-head
+  - output-allgather
+  - sampling
+  - memcopy
+  - unknown
+
+# ---------------------------------------------------------------------------
+# NVIDIA kernel rules (used by map_nv_kernels.py)
+# ---------------------------------------------------------------------------
+layers:
+  - name: "rmsnorm+shortcut (pre-attention)"
+    operation: "RMSNorm + residual add"
+    kernel_patterns:
+      - "tensorrt_llm::v1::kernels::reduce_fusion::r.*"
+      - "flashinfer::RMSNormKernel.*"
+
+  - name: "qkv-projection"
+    operation: "GEMM (QKV projection, Split-K + bias)"
+    kernel_patterns:
+      - "nvjet_tst_sm100_tst_32x64_64x16_4x1_v.*"
+      - "nvjet_sm100_tst_32x64_64x16_4x1_v.*"
+      - "cublasLt::splitKReduce_kernel.*"
+
+  - name: "qk rope + kvcache"
+    operation: "RoPE + KV cache update"
+    kernel_patterns:
+      - "tensorrt_llm::v1::kernels::applyBiasRopeUp.*"
+
+  - name: "attention"
+    operation: "Sliding window attention (SWA) / Full attention"
+    kernel_patterns:
+      - "fmhaSm100fKernel_.*CausalP32MultiCtask.*"
+      - "fmhaSm100fKernel_.*"
+      - "tensorrt_llm::v1::kernels::computeSeqAndPaddingOffsets.*"
+
+  - name: "o-project"
+    operation: "GEMM (output projection)"
+    kernel_patterns:
+      - "nvjet_tst_sm100_tst_64x8_64x16_.*"
+      - "nvjet_tst_sm100_tst_32x64_64x16_4x2_.*"
+      - "nvjet_tst_sm100_tst_64x16_64x16_.*"
+      - "nvjet_sm100_tst_64x80_64x16_.*"
+      - "nvjet_sm100_tst_64x64_64x16_.*"
+      - "nvjet_sm100_tst_64x16_64x16_.*"
+      - "nvjet_sm100_tst_128x176_64x7_.*"
+      - "nvjet_sm100_tst_24x64_64x16_.*"
+
+  - name: "nccl-allreduce"
+    operation: "Cross-GPU NCCL collective communications"
+    kernel_patterns:
+      - "ncclSymbDevKernel_AllReduce.*"
+      - "ncclDevKernel_AllGather.*"
+
+  - name: "o-project / TP all-reduce"
+    operation: "Fused allreduce + rmsnorm (TP)"
+    kernel_patterns:
+      - "tensorrt_llm::v1::kernels::ar::fusion::allredu.*"
+
+  - name: "rmsnorm+shortcut (pre-MoE)"
+    operation: "RMSNorm + residual add"
+    kernel_patterns: []
+    note: "Fused into the above allreduce kernel"
+
+  - name: "gating"
+    operation: "Top-k softmax / Routing + index clustering"
+    kernel_patterns:
+      - "void at::native::reduce_kernel<.*"
+      - "void moe::dev::routing::routingRenormalize.*"
+      - "void moe::dev::routing::routingIndicesOffsetsKernel.*"
+      - "void moe::dev::routing::routingIndicesHistogramKernel.*"
+
+  - name: "quant/sort"
+    operation: "Quantize inputs + MoE prep"
+    kernel_patterns:
+      - "tensorrt_llm::v1::kernels::quantize_with_bl.*"
+      - "tensorrt_llm::v1::kernels::block_scale_inter.*"
+      - "void at::native::.*scatter_gather_element.*"
+
+  - name: "moe-stage-1"
+    operation: "Expert GEMM + SiLU activation + reduce"
+    kernel_patterns:
+      - "void tinygemm<.*"
+      - "void tinygemm_kernel<.*"
+      - "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_B.*"
+      - "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_b.*"
+
+  - name: "moe-stage-2"
+    operation: "Expert GEMM (BFloat16) + Finalize (weighted combine)"
+    kernel_patterns:
+      - "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_.*"
+      - "void moe::dev::finalize::.*"
+      - "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_[^Bb].*"
+
+  - name: "moe-stage-2 / TP all-reduce"
+    operation: "TP all-reduce (also does rmsnorm)"
+    kernel_patterns: []
+    note: "Shares kernel with o-project TP all-reduce pattern"
+
+  - name: "output projection"
+    operation: "LM head GEMM"
+    kernel_patterns:
+      - "nvjet_sm100_tst_192x8_64x8_.*"
+
+  - name: "elementwise"
+    operation: "Miscellaneous elementwise / memory operations"
+    kernel_patterns:
+      - "void at::native::index_elementwise_kernel.*"
+      - "void at::native::unrolled_elementwise_kernel.*"
+      - "void at::native::elementwise_kernel.*"
+      - "void at::native::vectorized_elementwise_kernel.*"
+      - "triton_poi_fused_.*"
+      - "void at::.*CatArrayBatchedCopy.*"
+      - "at_cuda_detail::cub::detail::scan::DeviceScan.*"
+      - "void at::native::index_fill_kernel.*"
+      - "void at::native::vectorized_gather_kernel.*"
+
+# ---------------------------------------------------------------------------
+# AMD GPU kernel rules (used by map_amd_kernels.py)
+#
+# Each rule has:
+#   match_all  — list of substrings that must ALL appear in the GPU kernel name
+#   targets    — list of {layer, short_name, fraction (default 1.0)}
+# Rules are evaluated top-to-bottom; first match wins.
+# ---------------------------------------------------------------------------
+amd_gpu_kernel_rules:
+  - match_all: ["rmsnorm", "true"]
+    targets:
+      - layer: "rmsnorm+shortcut (pre-attention)"
+        short_name: "add_rmsnorm_quant (decode)"
+        fraction: 0.5
+      - layer: "rmsnorm+shortcut (pre-MoE)"
+        short_name: "add_rmsnorm_quant (decode)"
+        fraction: 0.5
+
+  - match_all: ["rmsnorm", "false"]
+    targets:
+      - layer: "rmsnorm+shortcut (pre-attention)"
+        short_name: "add_rmsnorm_quant (prefill)"
+
+  - match_all: ["Cijk_Alik_Bljk", "DTLA1_DTLB1"]
+    targets:
+      - layer: qkv-projection
+        short_name: "Cijk GEMM (QKV decode)"
+
+  - match_all: ["Cijk_Alik_Bljk", "MT16x16x256", "EPS1"]
+    targets:
+      - layer: o-project
+        short_name: "Cijk GEMM (O-proj decode)"
+
+  - match_all: ["Cijk_Alik_Bljk", "MT256x16x64"]
+    targets:
+      - layer: lm-head
+        short_name: "Cijk GEMM (LM head prefill)"
+
+  - match_all: ["_fused_qk_rope_reshape_and_cache_kernel"]
+    targets:
+      - layer: "qk rope + kvcache"
+        short_name: "fused_qk_rope_reshape_and_cache"
+
+  - match_all: ["attention", "window"]
+    targets:
+      - layer: attention
+        short_name: "sliding_window_attention"
+
+  - match_all: ["attention", "reduce"]
+    targets:
+      - layer: attention
+        short_name: "attention_reduce"
+
+  - match_all: ["bf16gemm_fp32bf16_tn"]
+    targets:
+      - layer: gating
+        short_name: "bf16gemm (gating GEMM)"
+
+  - match_all: ["topkGatingSoftmax"]
+    targets:
+      - layer: gating
+        short_name: "topkGatingSoftmax"
+
+  - match_all: ["MoeSortingKernel"]
+    targets:
+      - layer: quant/sort
+        short_name: "MoeSortingKernel"
+
+  - match_all: ["triton_poi_fused_constant_pad_nd_moe_forward"]
+    targets:
+      - layer: gating
+        short_name: "triton_fused_pad_moe"
+
+  - match_all: ["MoeFlatmmKernel", "Swiglu"]
+    targets:
+      - layer: moe-stage-1
+        short_name: "MoeFlatmm (gate+up SwiGLU)"
+
+  - match_all: ["MoeFlatmmKernel", "MoeSilu"]
+    targets:
+      - layer: moe-stage-2
+        short_name: "MoeFlatmm (down proj)"
+
+  - match_all: ["mscclKernel_Sum"]
+    targets:
+      - layer: nccl-allreduce
+        short_name: "mscclKernel_Sum"
+
+  - match_all: ["cross_device_reduce_1stage"]
+    targets:
+      - layer: nccl-allreduce
+        short_name: "cross_device_reduce_1stage"
+
+  - match_all: ["allgather_lastdim"]
+    targets:
+      - layer: output-allgather
+        short_name: "allgather_lastdim"
+
+  - match_all: ["mix_sample_outer_exponential"]
+    targets:
+      - layer: sampling
+        short_name: "mix_sample_outer_exponential"
+
+  - match_all: ["ncclDevKernel_Generic"]
+    targets:
+      - layer: nccl-allreduce
+        short_name: "ncclDevKernel_Generic_1"
+
+  - match_all: ["kv_indices_generate_kernel"]
+    targets:
+      - layer: attention
+        short_name: "kv_indices_generate"
+
+  - match_all: ["_masked_embedding_kernel"]
+    targets:
+      - layer: embedding
+        short_name: "masked_embedding"
+
+  - match_all: ["__amd_rocclr_fillBufferAligned"]
+    targets:
+      - layer: memcopy
+        short_name: "fillBufferAligned"
+
+  - match_all: ["__amd_rocclr_copyBuffer"]
+    targets:
+      - layer: memcopy
+        short_name: "copyBuffer"
+
+# ---------------------------------------------------------------------------
+# AMD CPU-op fallback rules (used when GPU kernel name is unrecognized)
+#
+# Each rule: substring "pattern" in the CPU op name → "short_name".
+# gemm_cpu_ops: CPU ops that trigger shape-based sub-classification
+#               (the shape logic stays in Python as _classify_cijk_by_shape).
+# ---------------------------------------------------------------------------
+amd_cpu_op_rules:
+  - pattern: "masked_embedding"
+    short_name: "masked_embedding"
+  - pattern: "add_rmsnorm"
+    short_name: "add_rmsnorm_quant (decode)"
+  - pattern: "rmsnorm2d_fwd_with_add"
+    short_name: "add_rmsnorm_quant (decode)"
+  - pattern: "rmsnorm2d_fwd_"
+    short_name: "add_rmsnorm_quant (prefill)"
+  - pattern: "fused_qk_rope"
+    short_name: "fused_qk_rope_reshape_and_cache"
+  - pattern: "unified_attention"
+    short_name: "sliding_window_attention"
+  - pattern: "mha_varlen"
+    short_name: "sliding_window_attention"
+  - pattern: "topk_softmax"
+    short_name: "topkGatingSoftmax"
+  - pattern: "moe_sorting"
+    short_name: "MoeSortingKernel"
+  - pattern: "moe_cktile2stages_gemm1"
+    short_name: "MoeFlatmm (gate+up SwiGLU)"
+  - pattern: "fused_moe_"
+    short_name: "MoeFlatmm (gate+up SwiGLU)"
+  - pattern: "moe_cktile2stages_gemm2"
+    short_name: "MoeFlatmm (down proj)"
+  - pattern: "cross_device_reduce"
+    short_name: "cross_device_reduce_1stage"
+  - pattern: "all_reduce"
+    short_name: "cross_device_reduce_1stage"
+  - pattern: "allgather"
+    short_name: "allgather_lastdim"
+  - pattern: "mix_sample"
+    short_name: "mix_sample_outer_exponential"
+  - pattern: "triton_poi_fused"
+    short_name: "triton_fused_pad_moe"
+
+amd_gemm_cpu_ops:
+  - "gemm_a16w16"
+  - "aten::addmm"
+  - "aten::matmul"
