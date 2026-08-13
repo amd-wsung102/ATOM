@@ -4,14 +4,18 @@
 import itertools
 import logging
 import time
+from collections import Counter
 from dataclasses import fields
-from typing import List, Union
+from typing import Any
+
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
-from atom.model_engine.engine_core_mgr import CoreManager
+from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -35,7 +39,9 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
+        data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
+        self.config = config
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
         )
@@ -47,14 +53,96 @@ class LLMEngine:
         config.stop_token_ids = list(stop_token_ids)
         # Set data parallel size in config
         config.parallel_config.data_parallel_size = data_parallel_size
+        if data_parallel_master_port is not None:
+            config.parallel_config.data_parallel_master_port = data_parallel_master_port
         self.data_parallel_size = data_parallel_size
-        self.rquest_ids = set()
+        # PCP and DP-attention are not yet compatible: PCP stripe-splits
+        # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
+        # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
+        # the FULL (un-split) token count, so all_gatherv asserts
+        # `1/pcp_size != full`.
+        if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
+            raise ValueError(
+                "prefill_context_parallel_size > 1 (-pcp) combined with "
+                "--enable-dp-attention is not supported yet (may be supported "
+                "in a future release): PCP splits tokens to 1/pcp_size while "
+                "DP-attention's id-gather expects the full token count, "
+                "causing an all_gatherv size mismatch. For now, disable one of "
+                "them (use -tp N -pcp M without DP-attention, or -dp N "
+                "--enable-dp-attention without -pcp)."
+            )
+        # PCP + TBO prefill: supported via coordinated splitting.
+        # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
+        # per-request ubatch split are unverified).
+        if config.prefill_context_parallel_size > 1 and config.enable_tbo:
+            # TBO overlaps compute with the attn<->MoE PCP collectives, which
+            # only exist in MoE merge mode (ATOM_PCP_MOE_MERGE=1). With
+            # ATOM_PCP_MOE_MERGE=0, MoE runs on each rank's 1/W token shard
+            # with NO extra comm between attn and MoE, so TBO has nothing
+            # to overlap and only adds ubatch-splitting overhead. Force it off.
+            if not envs.ATOM_PCP_MOE_MERGE:
+                logger.warning(
+                    "Disabling TBO because ATOM_PCP_MOE_MERGE=0: in this "
+                    "situation it runs MoE on each rank's 1/W token shard with "
+                    "no extra attn<->MoE communication, so TBO has nothing to "
+                    "overlap and only adds overhead."
+                )
+                config.enable_tbo = False
+                config.enable_tbo_decode = False
+            elif config.tensor_parallel_size > 1:
+                # Cross-communicator (PCP x TP) RCCL deadlock:
+                # under TBO the PCP collectives (comm_stream) run concurrently
+                # and UNORDERED with the TP-group all_reduces (compute_stream,
+                # from attention wo_b / MoE RowParallelLinear). On the TPxPCP
+                # rank grid with large collectives this forms a cross-rank
+                # circular wait -> hang (reproduced MI355 TP4PCP2/TP2PCP4 merge
+                # +TBO, 64k/c32). Serialized (non-TBO single stream) is fine, and
+                # TP=1 has no TP communicator so it cannot form the cycle. Only
+                # TP=1 + PCP keeps TBO; TP>1 falls back to non-TBO.
+                logger.warning(
+                    "Disabling TBO: prefill_context_parallel_size > 1 (-pcp) "
+                    "with tensor_parallel_size > 1 (-tp) hangs under TBO due to "
+                    "a PCP<->TP cross-communicator RCCL deadlock (concurrent "
+                    "unordered collectives on comm/compute streams; see "
+                    "PCP_TBO.md 14.4). TBO with PCP is only supported at -tp 1 "
+                    "(e.g. -tp 1 -pcp 8)."
+                )
+                config.enable_tbo = False
+                config.enable_tbo_decode = False
+            elif config.enable_tbo_decode:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) combined with "
+                    "--enable-tbo all (decode TBO) is not supported yet. "
+                    "Use --enable-tbo (prefill only) with -pcp."
+                )
+            # Under PCP, TBO prefill uses a request-boundary split (the
+            # non-default TBO split mode; never token-midpoint split), so
+            # ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored.
+            if config.enable_tbo and envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:
+                logger.warning(
+                    "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
+                    "prefill uses request-boundary balanced grouping."
+                )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
-        self.core_mgr = CoreManager(config)
+        if config.enable_rapidserve:
+            self.core_mgr = DisaggCoreManager(config)
+        else:
+            self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
+        import json
+
+        kv_config_str = kwargs.get("kv_transfer_config", "{}")
+        try:
+            config.kv_transfer_config = json.loads(kv_config_str)
+            logger.info(f"KV transfer config loaded: {config.kv_transfer_config}")
+        except json.JSONDecodeError:
+            config.kv_transfer_config = {}
+        logger.info(
+            f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
+        )
         logger.info(
             f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
         )
@@ -66,9 +154,11 @@ class LLMEngine:
 
     def add_request(
         self,
-        prompt_or_tokens_list: List[Union[str, List[int]]],
-        sampling_params_list: SamplingParams | List[SamplingParams],
+        prompt_or_tokens_list: list[str | list[int]],
+        sampling_params_list: SamplingParams | list[SamplingParams],
         stream_callback=None,
+        multimodal_data_list: list[dict] | None = None,
+        request_ids: list[str] | None = None,
     ):
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
@@ -95,12 +185,42 @@ class LLMEngine:
         else:
             stream_callback_iter = itertools.repeat(None)
 
+        # Handle multimodal data
+        if multimodal_data_list is not None:
+            if len(prompt_or_tokens_list) != len(multimodal_data_list):
+                raise ValueError(
+                    f"number of elements in prompt_or_tokens_list and multimodal_data_list is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(multimodal_data_list)=}"
+                )
+            mm_data_iter = multimodal_data_list
+        else:
+            mm_data_iter = itertools.repeat(None)
+
+        # Handle request_ids
+        if request_ids is not None:
+            if len(request_ids) != len(prompt_or_tokens_list):
+                raise ValueError(
+                    "number of elements in prompt_or_tokens_list and request_ids is different: "
+                    f"{len(prompt_or_tokens_list)=} vs {len(request_ids)=}"
+                )
+            request_id_iter = iter(request_ids)
+        else:
+            request_id_iter = itertools.repeat(None)
+
         reqs = []
-        for prompt, sampling_param, callback in zip(
-            prompt_or_tokens_list, sampling_params_iter, stream_callback_iter
+        for prompt, sampling_param, callback, mm_data, request_id in zip(
+            prompt_or_tokens_list,
+            sampling_params_iter,
+            stream_callback_iter,
+            mm_data_iter,
+            request_id_iter,
         ):
             req = self.io_processor.preprocess(
-                prompt, sampling_param, stream_callback=callback
+                prompt,
+                sampling_param,
+                stream_callback=callback,
+                multimodal_data=mm_data,
+                request_id=request_id,
             )
             reqs.append(req)
         self.core_mgr.add_request(reqs)
@@ -114,14 +234,39 @@ class LLMEngine:
 
     def generate(
         self,
-        # prompts: list[str] | list[list[int]],
         prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
+        request_ids: list[str] | None = None,
     ) -> list[str]:
-        # Reset round-robin counter to ensure consistent DP not core dump
-        self.core_mgr._rr_counter = 0
+        # Reset DP routing state (round-robin cursor + in-flight load) so a
+        # fresh batch gets deterministic DP assignment and no leaked counts.
+        self.core_mgr.reset_dp_router()
 
-        self.add_request(prompts, sampling_params)
+        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        outputs = {}
+        while not self.is_finished() and (
+            self.core_mgr.is_alive() or self.core_mgr.is_rest()
+        ):
+            seqs = self.step()
+            outs = self.io_processor.postprocess(seqs)
+            outputs.update(outs)
+
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+        return outputs
+
+    def generate_multimodal(
+        self,
+        token_ids_list: list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        multimodal_data_list: list[dict],
+    ) -> list[dict]:
+        """Generate completions for multimodal inputs (token IDs + vision data)."""
+        self.core_mgr.reset_dp_router()
+        self.add_request(
+            token_ids_list,
+            sampling_params,
+            multimodal_data_list=multimodal_data_list,
+        )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -134,14 +279,121 @@ class LLMEngine:
         return outputs
 
     def start_profile(self):
-        self.core_mgr.send_utility_command("start_profile")
+        self.core_mgr.broadcast_utility_command_sync("start_profile")
         logger.info("Profiling started")
 
-    def stop_profile(self):
-        self.core_mgr.send_utility_command("stop_profile")
+    def stop_profile(self) -> list[dict[str, Any]]:
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "stop_profile", timeout=envs.ATOM_PROFILER_TIMEOUT
+        )
+        return [resp.get("result", {}) for resp in responses]
 
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
+
+    def get_mtp_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Return aggregated speculative decoding statistics across DP ranks."""
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_mtp_statistics", timeout=timeout
+        )
+        rank_stats = [
+            resp.get("result", resp)
+            for resp in responses
+            if resp.get("result", resp).get("enabled", False)
+        ]
+
+        distribution: Counter[int] = Counter()
+        for stats in rank_stats:
+            distribution.update(
+                {
+                    int(accepted): int(steps)
+                    for accepted, steps in stats.get("distribution", {}).items()
+                }
+            )
+
+        total_draft_tokens = sum(
+            int(stats.get("total_draft_tokens", 0)) for stats in rank_stats
+        )
+        total_accepted_tokens = sum(
+            int(stats.get("total_accepted_tokens", 0)) for stats in rank_stats
+        )
+        total_steps = sum(distribution.values())
+
+        return {
+            "enabled": bool(rank_stats),
+            "total_draft_tokens": total_draft_tokens,
+            "total_accepted_tokens": total_accepted_tokens,
+            "acceptance_rate": (
+                total_accepted_tokens / total_draft_tokens
+                if total_draft_tokens
+                else 0.0
+            ),
+            "average_tokens_per_forward": (
+                1 + total_accepted_tokens / total_steps if total_steps else 0.0
+            ),
+            "distribution": dict(sorted(distribution.items())),
+            "distribution_percent": {
+                k: v / total_steps if total_steps else 0.0
+                for k, v in sorted(distribution.items())
+            },
+        }
+
+    def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Return aggregated prefix-cache statistics across DP ranks.
+
+        The four rates are the ones `[Cache Stats]` logs, recomputed from
+        summed counters rather than averaged: ranks admit different numbers of
+        tokens, so the mean of their rates is not the rate of their union.
+
+        `cached <= wanted <= compressed <= full` by construction, which is what
+        makes the differences below meaningful:
+          hit                 reuse actually admitted
+          compressed_hit      reuse the prefix index held, before the
+                              per-request state classes had their say
+          lost_to_checkpoint  declined only because no checkpoint existed at
+                              that boundary — what a denser ladder recovers
+          lost_unrecoverable  declined for a reason no checkpoint touches
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_cache_statistics", timeout=timeout
+        )
+        rank_stats = [
+            resp.get("result", resp)
+            for resp in responses
+            if resp.get("result", resp).get("enabled", False)
+        ]
+        totals = {
+            key: sum(int(stats.get(key, 0)) for stats in rank_stats)
+            for key in (
+                "requests",
+                "cached_tokens",
+                "compressed_tokens",
+                "wanted_tokens",
+                "full_tokens",
+                "checkpoints_kept",
+                "checkpoints_dropped",
+                "checkpoints_evicted",
+                "demands_recorded",
+                "chunks_cut_for_demand",
+            )
+        }
+        full = totals["full_tokens"]
+
+        def rate(num: int) -> float:
+            return num / full if full else 0.0
+
+        return {
+            "enabled": bool(rank_stats),
+            **totals,
+            "hit": rate(totals["cached_tokens"]),
+            "compressed_hit": rate(totals["compressed_tokens"]),
+            "lost_to_checkpoint": rate(
+                totals["wanted_tokens"] - totals["cached_tokens"]
+            ),
+            "lost_unrecoverable": rate(
+                totals["compressed_tokens"] - totals["wanted_tokens"]
+            ),
+        }
 
 
 class InputOutputProcessor:
@@ -151,7 +403,14 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
-        self.mamba_enabled = False
+        # `has_per_req_cache` flags model architectures that need a
+        # per-request stateful buffer outside the paged KV pool. Sequences
+        # constructed for these models trigger BlockManager to reserve a
+        # per-req cache slot. Currently: GDN-based models (Qwen3-Next /
+        # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
+        self._external_to_internal: dict[str, int] = {}
+        self._internal_to_external: dict[int, str] = {}
+        self.has_per_req_cache = False
         self.num_speculative_tokens = 0
         if (
             hasattr(self.config, "speculative_config")
@@ -160,24 +419,105 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
+        if self.config.hf_config.model_type in self._per_req_cache_model_types():
+            self.has_per_req_cache = True
 
-        if self.config.hf_config.model_type == "qwen3_next":
-            self.mamba_enabled = True
+    @staticmethod
+    def _per_req_cache_model_types() -> frozenset[str]:
+        """Single source of truth for which model_types use per-req cache.
+
+        Read by Sequence-construction (here) AND by ModelRunner's startup
+        sanity check, which asserts that any model whose attention builder
+        declares a per-request state sub-pool has its model_type
+        registered here. Adding a new stateful-attention model means
+        adding its model_type to this set.
+        """
+        return frozenset(
+            {
+                "qwen3_next",
+                "qwen3_5_text",
+                "qwen3_5_moe_text",
+                "kimi_linear",
+                "deepseek_v4",
+            }
+        )
 
     def preprocess(
         self,
         prompt_or_tokens: str | list[int],
         sampling_params: SamplingParams,
         stream_callback=None,
+        kv_transfer_params=None,
+        multimodal_data=None,
+        request_id: str | None = None,
+        data_parallel_rank: int | None = None,
     ):
         """responsible for:
         1) Tokenize
-        2) Create Sequence object"""
+        2) Create Sequence object
+
+        Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
+        callers which expect exactly one ``Sequence`` back cannot silently
+        drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
+        """
+        if getattr(sampling_params, "n", 1) > 1:
+            raise ValueError(
+                "preprocess() returns a single Sequence; for SamplingParams.n > 1 "
+                "call preprocess_fanout() and manage the returned list."
+            )
+        seqs = self.preprocess_fanout(
+            prompt_or_tokens,
+            sampling_params,
+            stream_callback=stream_callback,
+            kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
+            parent_request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
+        )
+        return seqs[0]
+
+    def preprocess_fanout(
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        stream_callback=None,
+        stream_callbacks: list | None = None,
+        kv_transfer_params=None,
+        multimodal_data=None,
+        parent_request_id: str | None = None,
+        data_parallel_rank: int | None = None,
+    ) -> list[Sequence]:
+        """Tokenize once and materialize ``sampling_params.n`` Sequences.
+
+        Returns a list of length ``n``. For ``n == 1`` this is functionally
+        equivalent to the legacy single-sequence path. For ``n > 1``:
+
+        * The prompt is tokenized a single time and the token list is copied
+          into each sibling (``Sequence`` copies internally, so mutations stay
+          isolated).
+        * Every sibling is marked ``needs_independent_noise=True`` so the
+          sampler generates fresh per-row noise instead of reusing the cached
+          shared exponential tensor. Without this, siblings with identical
+          logits would emit identical tokens.
+        * Per-sibling ``stream_callbacks`` can be supplied to route streaming
+          deltas to independent queues (one per choice index). Falls back to
+          the scalar ``stream_callback`` for every sibling.
+        """
+        n = max(1, int(getattr(sampling_params, "n", 1)))
+
         tokens = (
             self.tokenizer.encode(prompt_or_tokens)
             if isinstance(prompt_or_tokens, str)
             else prompt_or_tokens
         )
+        mrope_positions = None
+        mrope_position_delta = 0
+        if multimodal_data is not None:
+            mrope_positions, mrope_position_delta = get_mrope_input_positions(
+                self.config,
+                tokens,
+                multimodal_data,
+            )
 
         stop_token_sequences = []
         if sampling_params.stop_strings:
@@ -187,35 +527,69 @@ class InputOutputProcessor:
                 else sampling_params.stop_strings
             )
             for stop_str in stops:
-                # Encode the full stop string as a sequence of tokens
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
 
-        seq = Sequence(
-            tokens,
-            self.block_size,
-            sampling_params,
-            stop_token_sequences,
-            stream_callback=stream_callback,
-            num_draft_tokens=self.num_speculative_tokens,
-            mamba_enabled=self.mamba_enabled,
-        )
-        seq.arrive_time = time.time()
-        self.requests[seq.id] = seq
-        logger.info(
-            f"Request {seq.id} arrived, input tokens: {len(tokens)}, pending requests: {len(self.requests)} "
-            # f"<{prompt_or_tokens=}>"
-        )
-        return seq
+        if stream_callbacks is not None and len(stream_callbacks) != n:
+            raise ValueError(
+                f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
+            )
 
-    def postprocess(self, reqs: List[Sequence]):
+        seqs: list[Sequence] = []
+        for i in range(n):
+            cb = (
+                stream_callbacks[i] if stream_callbacks is not None else stream_callback
+            )
+            seq = Sequence(
+                tokens,
+                self.block_size,
+                sampling_params,
+                stop_token_sequences,
+                stream_callback=cb,
+                num_draft_tokens=self.num_speculative_tokens,
+                has_per_req_cache=self.has_per_req_cache,
+                kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
+                mrope_positions=mrope_positions,
+                mrope_position_delta=mrope_position_delta,
+                needs_independent_noise=(n > 1),
+                parent_request_id=parent_request_id,
+                sibling_index=i,
+                request_id=parent_request_id if n == 1 else None,
+                data_parallel_rank=data_parallel_rank,
+            )
+            seq.arrive_time = time.time()
+            self.requests[seq.id] = seq
+            if seq.external_request_id is not None:
+                self._external_to_internal[seq.external_request_id] = seq.id
+                self._internal_to_external[seq.id] = seq.external_request_id
+            seqs.append(seq)
+
+        if n == 1:
+            logger.info(
+                f"Request {seqs[0].id} arrived, input tokens: {len(tokens)}, "
+                f"pending requests: {len(self.requests)}"
+            )
+        else:
+            logger.info(
+                f"Request {parent_request_id or seqs[0].id} fanned out into "
+                f"{n} siblings ({seqs[0].id}..{seqs[-1].id}), "
+                f"input tokens: {len(tokens)}, "
+                f"pending requests: {len(self.requests)}"
+            )
+        return seqs
+
+    def postprocess(self, reqs: list[Sequence]):
         """responsible for:
         1) Compute stats for logging
         2) Detokenize"""
         outputs = {}
         for req in reqs:
             self.requests.pop(req.id)
+            external_request_id = self._internal_to_external.pop(req.id, None)
+            if external_request_id is not None:
+                self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
             req.leave_time = time.time()
 
@@ -235,11 +609,11 @@ class InputOutputProcessor:
                 f"Input tokens: {req.num_prompt_tokens}, output tokens: {req.num_completion_tokens}, "
                 f"latency: {req.leave_time - req.arrive_time:.2f}s, "
                 f"TTFT: {ttft:.3f}s, TPOT: {tpot:.3f}s"
-                # f"{req.completion_token_ids}"
             )
             outputs[req.id] = {
                 "text": output_str,
                 "token_ids": req.completion_token_ids,
+                "logprobs": req.logprobs if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,
                 "num_tokens_input": req.num_prompt_tokens,

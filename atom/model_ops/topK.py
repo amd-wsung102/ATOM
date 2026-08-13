@@ -11,27 +11,75 @@ from atom.model_ops.utils import _has_module
 from atom.utils.custom_register import direct_register_custom_op
 
 
-@torch_compile_guard()
-def is_rocm_aiter_fusion_shared_expert_enabled() -> bool:
+def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+    quant_config,
+    shared_expert_prefix: Optional[str] = None,
+    routed_expert_prefix: Optional[str] = None,
+) -> bool:
     config = get_current_atom_config()
-
-    quant_config = config.quant_config
-    is_shared_experts_excluded = False
-    is_experts_excluded = False
-    exclude_layers = quant_config.exclude_layers or []
-    for layer in exclude_layers:
-        if "shared_experts" in layer:
-            is_shared_experts_excluded = True
-        if "experts" in layer and "shared_experts" not in layer:
-            is_experts_excluded = True
-    # don't fuse shared experts if they don't share the same quantization
-    if is_shared_experts_excluded != is_experts_excluded:
-        return False
+    if quant_config is None:
+        quant_config = config.quant_config
 
     dp_size = config.parallel_config.data_parallel_size
+    # Shared-expert fusion is incompatible with the flattened DP x TP MoE-EP
+    # layout (set by the vLLM plugin under DP+EP); disable it there.
+    if dp_size > 1 and config.moe_ep_flatten_tp_across_dp:
+        return False
     if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
         return False
+
+    if quant_config is not None and shared_expert_prefix is not None:
+        shared_spec = quant_config.get_layer_quant_config(
+            shared_expert_prefix,
+            check_children=True,
+        )
+        routed_spec = (
+            quant_config.get_layer_quant_config(
+                routed_expert_prefix,
+                check_children=True,
+            )
+            if routed_expert_prefix is not None
+            else quant_config.global_quant_config
+        )
+        return (
+            shared_spec.quant_dtype == routed_spec.quant_dtype
+            and shared_spec.quant_type == routed_spec.quant_type
+            and shared_spec.is_dynamic == routed_spec.is_dynamic
+        )
+
+    # Resolve actual dtypes for shared experts vs routed experts.
+    # Find a representative shared expert entry from the exclude list to
+    # get its resolved dtype, then compare against the global quant spec
+    # (which represents the dtype of non-excluded routed experts).
+    # We cannot use a fixed probe prefix because the exclude list format
+    # changes after remap_layer_name (native vs plugin mode, packed_modules
+    # remap). Instead, pick the first exclude entry that mentions
+    # "shared_expert" and resolve its dtype via get_layer_quant_config.
+    exclude_layers = quant_config.exclude_layers or []
+    for entry in exclude_layers:
+        if "shared_experts" in entry or "shared_expert" in entry:
+            shared_spec = quant_config.get_layer_quant_config(entry)
+            # Compare shared expert dtype against the global (routed) dtype.
+            # If they differ, shared experts cannot be fused into the MoE
+            # kernel (e.g. shared experts are BF16 while routed are FP4).
+            if shared_spec.quant_dtype != quant_config.quant_dtype:
+                return False
+            break
+
     return True
+
+
+@torch_compile_guard()
+def is_rocm_aiter_fusion_shared_expert_enabled(
+    shared_expert_prefix: Optional[str] = None,
+    routed_expert_prefix: Optional[str] = None,
+) -> bool:
+    config = get_current_atom_config()
+    return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+        config.quant_config,
+        shared_expert_prefix=shared_expert_prefix,
+        routed_expert_prefix=routed_expert_prefix,
+    )
 
 
 def is_rocm_aiter_fuse_routed_scaling_factor():
@@ -99,8 +147,7 @@ def rocm_aiter_topk_softmax_impl(
 
     token = gating_output.shape[0]
     device = gating_output.device
-    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -135,7 +182,7 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel,
         fused_shared_experts_scoring_func,
     )
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 
@@ -169,8 +216,7 @@ def rocm_aiter_biased_grouped_topk_impl(
 
     token = gating_output.shape[0]
     device = gating_output.device
-    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -201,7 +247,7 @@ def rocm_aiter_biased_grouped_topk_impl(
         need_renorm,
         routed_scaling_factor,
     )
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 
@@ -218,8 +264,7 @@ def rocm_aiter_biased_grouped_topk_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = gating_output.shape[0]
     device = gating_output.device
-    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -250,7 +295,7 @@ def rocm_aiter_biased_grouped_topk_fake(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 
@@ -272,8 +317,7 @@ def rocm_aiter_grouped_topk_impl(
 
     token = gating_output.shape[0]
     device = gating_output.device
-    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -304,7 +348,7 @@ def rocm_aiter_grouped_topk_impl(
         scoring_func,
         routed_scaling_factor,
     )
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 
@@ -323,8 +367,7 @@ def rocm_aiter_grouped_topk_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = gating_output.shape[0]
     device = gating_output.device
-    fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         assert aiter_topK_meta_data is not None, (
             "AITER topK meta data is not initialized. "
             "Please ensure that init_aiter_topK_meta_data is called before this function."
@@ -355,7 +398,7 @@ def rocm_aiter_grouped_topk_fake(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    if fuse_shared_experts and num_fused_shared_experts > 0:
+    if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
 

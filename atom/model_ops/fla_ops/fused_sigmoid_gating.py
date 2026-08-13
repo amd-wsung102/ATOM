@@ -19,6 +19,7 @@ import triton.language as tl
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -29,6 +30,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     dt_bias,
     beta,
     threshold,
+    lower_bound,
     q,
     k,
     v,
@@ -48,6 +50,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    stride_a_token,
+    stride_b_token,
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
@@ -59,6 +63,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -87,13 +92,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     p_A_log = A_log + i_hv
     if not IS_KDA:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * stride_a_token + i_hv
         p_dt_bias = dt_bias + i_hv
     else:
         p_a = a + (bos * HV + i_hv) * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
 
-    p_b = b + bos * HV + i_hv
+    p_b = b + bos * stride_b_token + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
@@ -128,10 +133,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
-        softplus_x = tl.where(
-            beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-        )
-        b_g = -tl.exp(tl.load(p_A_log).to(tl.float32)) * softplus_x
+        b_A = tl.load(p_A_log).to(tl.float32)
+        if USE_LOWER_BOUND:
+            # Kimi-KDA lower-bounded sigmoid gate (matches fla
+            # fused_recurrent_kda's USE_LOWER_BOUND branch): the per-channel
+            # decay is `lower_bound * sigmoid(exp(A_log) * (a + dt_bias))`,
+            # keeping the log-decay bounded in `(lower_bound, 0)` rather than
+            # the unbounded `-exp(A) * softplus(.)` used by GDN.
+            b_g = lower_bound * tl.sigmoid(tl.exp(b_A) * x)
+        else:
+            softplus_x = tl.where(
+                beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+            )
+            b_g = -tl.exp(b_A) * softplus_x
 
         # compute beta_output = sigmoid(b)
         b_beta = tl.sigmoid(b_b.to(tl.float32))
@@ -175,8 +189,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_k += H * K
         p_o += HV * V
         p_v += HV * V
-        p_b += HV
-        p_a += HV
+        p_b += stride_b_token
+        p_a += stride_a_token
 
 
 def fused_sigmoid_gating_delta_rule_update(
@@ -187,6 +201,7 @@ def fused_sigmoid_gating_delta_rule_update(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    o: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
     scale: float = None,
@@ -197,11 +212,20 @@ def fused_sigmoid_gating_delta_rule_update(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    lower_bound: float | None = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
     This function uses a single fused kernel that combines both sigmoid gating
     computation and the recurrent delta rule update for better performance.
+
+    Gate variants:
+      * lower_bound is None (default, GDN / Qwen3-Next): the log-decay is the
+        unbounded `-exp(A_log) * softplus(a + dt_bias)`.
+      * lower_bound set (Kimi-KDA): the log-decay is the lower-bounded
+        `lower_bound * sigmoid(exp(A_log) * (a + dt_bias))`, matching fla's
+        `fused_recurrent_kda` USE_LOWER_BOUND branch. Pair with is_kda=True so
+        `a`/`dt_bias` are read as per-K-channel vectors (KDA's diagonal decay).
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -223,7 +247,10 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    if o is None:
+        o = q.new_empty(NK, *v.shape)
+    else:
+        o = o.unsqueeze(0)
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -242,11 +269,12 @@ def fused_sigmoid_gating_delta_rule_update(
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
-        a=a.contiguous(),
-        b=b.contiguous(),
+        a=a,
+        b=b,
         dt_bias=dt_bias,
         beta=beta,
         threshold=threshold,
+        lower_bound=lower_bound,
         q=q.contiguous(),
         k=k.contiguous(),
         v=v.contiguous(),
@@ -266,6 +294,10 @@ def fused_sigmoid_gating_delta_rule_update(
         V=V,
         BK=BK,
         BV=BV,
+        # Per-token stride of `a`: GDN gate is [B, T, HV] (T stride = stride(-2));
+        # KDA gate is per-K-channel [B, T, HV, K], so the token stride is stride(-3).
+        stride_a_token=a.stride(-3) if is_kda else a.stride(-2),
+        stride_b_token=b.stride(-2),
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,

@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next MTP model."""
 
+import copy
+import re
+
 import torch
-import torch.nn as nn
-from atom.config import Config
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.moe import FusedMoE
 from aiter.dist.parallel_state import get_tp_group
-from atom.models.utils import IntermediateTensors
-from atom.models.qwen3_next import Qwen3NextDecoderLayer, Qwen3NextRMSNorm
-from atom.model_ops.linear import ColumnParallelLinear
+from torch import nn
+
+from atom.config import Config
 from atom.model_config.qwen3_next import Qwen3NextConfig
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.linear import ColumnParallelLinear
+from atom.model_ops.moe import FusedMoE
+from atom.models.qwen3_next import Qwen3NextDecoderLayer, Qwen3NextRMSNorm
+from atom.models.utils import IntermediateTensors
+
 from .utils import maybe_prefix
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
@@ -43,6 +48,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             self.config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.fc",
         )
 
         self.layers = torch.nn.ModuleList(
@@ -107,21 +113,58 @@ class Qwen3NextMTP(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
     }
+    weights_mapping = {"mtp.": "model."}
+
+    def remap_mtp_weight_name(self, name: str) -> str | None:
+        """Filter MTP weights; remap (mtp.* → model.*) is via weights_mapping."""
+        shared_weight_names = ["embed_tokens", "lm_head"]
+
+        # MTP-specific weights
+        if name.startswith("mtp."):
+            return name
+
+        # Shared weights loaded into both target and draft
+        if any(key in name for key in shared_weight_names):
+            return name
+
+        # Skip target model weights
+        return None
 
     def __init__(self, atom_config: Config, prefix: str = ""):
-        config = atom_config.hf_config
-        self.vllm_config = atom_config
-        assert (
-            not atom_config.enable_prefix_caching
-        ), "Qwen3NextMTP currently does not support prefix caching"
-
-        self.quant_config = atom_config.quant_config
-
         super().__init__()
+        config = atom_config.hf_config
         self.config = config
+
+        # Checkpoint and quant config use draft-local indices
+        # (mtp.layers.0.*), while runtime layer prefixes use absolute indices
+        # (mtp.layers.<num_hidden_layers>.*) so vLLM allocates distinct draft KV
+        # layers. Keep quant excludes aligned with the runtime prefixes.
+        mtp_start = config.num_hidden_layers
+        num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1) or 1
+        mtp_atom_config = atom_config
+        if atom_config.quant_config is not None and mtp_start > 0:
+            pat = re.compile(r"^mtp\.layers\.(\d+)\.")
+            new_excludes = []
+            changed = False
+            for entry in atom_config.quant_config.exclude_layers:
+                m = pat.match(entry)
+                if m:
+                    old_idx = int(m.group(1))
+                    if old_idx < num_mtp_layers:
+                        changed = True
+                        entry = pat.sub(f"mtp.layers.{mtp_start + old_idx}.", entry)
+                new_excludes.append(entry)
+            if changed:
+                mtp_atom_config = copy.copy(atom_config)
+                mtp_qc = copy.copy(atom_config.quant_config)
+                mtp_qc.exclude_layers = list(dict.fromkeys(new_excludes))
+                mtp_atom_config.quant_config = mtp_qc
+
         self.model = Qwen3NextMultiTokenPredictor(
-            atom_config=atom_config, prefix=maybe_prefix(prefix, "mtp")
+            atom_config=mtp_atom_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
         self.lm_head = ParallelLMHead(
@@ -143,7 +186,12 @@ class Qwen3NextMTP(nn.Module):
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=kwargs.get("spec_step_idx", 0),
         )
         return hidden_states
 
@@ -154,35 +202,31 @@ class Qwen3NextMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids via distributed argmax — each rank reduces its
+        own vocab shard and only [N, 2] is all-gathered, instead of the full
+        [N, vocab] that compute_logits() would gather. Token-identical to
+        compute_logits(...).argmax(-1): the draft path never hits the LM head's
+        prefill last-token slice (is_draft is set for the whole propose loop),
+        so both see the same rows.
+        """
+        return self.lm_head.compute_argmax_token(hidden_states)
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        # Mirror target's get_expert_mapping: the loader may rewrite
+        # `mlp.shared_expert.*` to `mlp.experts.{N}.*` per layer, so the
+        # mapping must always include the extra shared-expert slot.
+        n_routed = getattr(self.config, "n_routed_experts", self.config.num_experts)
+        n_shared = getattr(self.config, "n_shared_experts", 1)
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=n_routed + (n_shared or 0),
         )
-
-
-def remap_mtp_weight_name(name: str) -> str | None:
-    """
-    Remap MTP weight names to match the model structure.
-    Returns None if the weight should be skipped.
-
-    MTP weights are stored with 'mtp.' prefix in checkpoints but loaded
-    into 'model.' in the actual model structure.
-    Shared weights (embed_tokens, lm_head) are loaded into both base model and MTP.
-    """
-    shared_weight_names = ["embed_tokens", "lm_head"]
-
-    # Remap mtp.* -> model.*
-    if name.startswith("mtp."):
-        return name.replace("mtp.", "model.")
-
-    # Allow shared weights to be loaded
-    if any(key in name for key in shared_weight_names):
-        return name
-
-    # Skip all other weights (they belong to base model, not MTP)
-    return None

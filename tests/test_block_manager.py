@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/block_manager.py — public API only
 
-from atom.model_engine.block_manager import BlockManager
+
 from conftest import MockConfig
+
+from atom.model_engine.block_manager import BlockManager
 
 # ── compute_hash ───────────────────────────────────────────────────────────
 
@@ -34,7 +36,7 @@ class TestComputeHash:
 class TestCanAllocate:
     def test_can_allocate_when_free(self, block_manager, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
-        assert block_manager.can_allocate(seq)
+        assert block_manager.can_allocate(seq) >= 0
 
     def test_cannot_allocate_when_full(self, seq_factory):
         cfg = MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4)
@@ -42,11 +44,11 @@ class TestCanAllocate:
         s1 = seq_factory([1, 2, 3, 4])
         bm.allocate(s1)
         s2 = seq_factory([5, 6, 7, 8])
-        assert not bm.can_allocate(s2)
+        assert bm.can_allocate(s2) < 0
 
     def test_can_allocate_multi_block(self, block_manager, seq_factory):
         seq = seq_factory([1, 2, 3, 4, 5])
-        assert block_manager.can_allocate(seq)
+        assert block_manager.can_allocate(seq) >= 0
 
 
 # ── allocate / deallocate ──────────────────────────────────────────────────
@@ -81,10 +83,10 @@ class TestAllocateDeallocate:
             others.append(s)
         # Full — can't allocate more
         probe = seq_factory([100, 101, 102, 103])
-        assert not block_manager.can_allocate(probe)
+        assert block_manager.can_allocate(probe) < 0
         # Deallocate one → can allocate again
         block_manager.deallocate(s1)
-        assert block_manager.can_allocate(probe)
+        assert block_manager.can_allocate(probe) >= 0
 
 
 # ── Prefix caching ────────────────────────────────────────────────────────
@@ -94,10 +96,12 @@ class TestPrefixCaching:
     def test_prefix_cache_hit(self, block_manager_prefix, seq_factory):
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         block_manager_prefix.allocate(s1)
+        block_manager_prefix.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
         block_manager_prefix.deallocate(s1)
 
         s2 = seq_factory([1, 2, 3, 4, 9, 10, 11, 12])
-        block_manager_prefix.allocate(s2)
+        n = block_manager_prefix.can_allocate(s2)
+        block_manager_prefix.allocate(s2, n)
         assert s2.num_cached_tokens == 4
 
     def test_prefix_cache_miss_different_tokens(
@@ -123,6 +127,36 @@ class TestPrefixCaching:
         assert len(s2.block_table) == 2
         # Deallocate s2 — no crash
         block_manager_prefix.deallocate(s2)
+
+
+class TestPublishLoadedPrefix:
+    def test_dcp_uses_hash_block_granularity(self, seq_factory, monkeypatch):
+        cfg = MockConfig(
+            num_kvcache_blocks=6,
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            enable_prefix_caching=True,
+        )
+        bm = BlockManager(cfg)
+        # This test targets loaded-prefix publication, so isolate allocation
+        # from the GPU-only dcp_ops module used to calculate local block counts.
+        monkeypatch.setattr(
+            bm,
+            "_dcp_num_blocks",
+            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
+        )
+        loaded = seq_factory(list(range(16)))
+        bm.allocate(loaded)
+
+        assert bm.publish_loaded_prefix(loaded, start_token=0, end_token=8) == 8
+        loaded_block = bm.kv.block(loaded.block_table[0])
+        assert loaded_block.token_ids == list(range(8))
+
+        probe = seq_factory(list(range(8)) + list(range(100, 108)))
+        num_cached_blocks = bm.can_allocate(probe)
+        assert num_cached_blocks == 1
+        bm.allocate(probe, num_cached_blocks)
+        assert probe.num_cached_tokens == 8
 
 
 # ── can_append / may_append ────────────────────────────────────────────────
@@ -180,22 +214,27 @@ class TestMayAppend:
 
 class TestCanAllocateWithPrefixCaching:
     def test_can_allocate_accounts_for_cache_hits(self, seq_factory):
-        """With 3 blocks total, allocate 2-block seq, deallocate, then a new
-        2-block seq sharing block 1 should need only 1 free block."""
+        """can_allocate must charge BOTH the cache-miss block AND the
+        cache-hit-on-free-pool block to the free-block budget, because the
+        cached block still has to be claimed off the free list."""
         cfg = MockConfig(
-            num_kvcache_blocks=3, kv_cache_block_size=4, enable_prefix_caching=True
+            num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
         )
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
         bm.deallocate(s1)  # blocks freed, hashes retained
 
-        # Use up 2 of the 3 free blocks
+        # Use up 2 of the 4 free blocks with non-overlapping tokens
         filler = seq_factory([50, 51, 52, 53, 60, 61, 62, 63])
         bm.allocate(filler)
-        # Only 1 free block left; s2 needs 2 blocks but first is cached
+        # 2 free blocks left. s2 needs 2 blocks (1 cached + 1 fresh): exactly fits.
         s2 = seq_factory([1, 2, 3, 4, 9, 10, 11, 12])
-        assert bm.can_allocate(s2)
+        n = bm.can_allocate(s2)
+        assert n == 1
+        bm.allocate(s2, n)
+        assert s2.num_cached_tokens == 4
 
     def test_can_allocate_no_false_positive(self, seq_factory):
         """can_allocate should return False when even with cache hits
@@ -208,7 +247,7 @@ class TestCanAllocateWithPrefixCaching:
         bm.allocate(s1)
         # 0 free blocks; new seq shares prefix but needs 1 new block
         s2 = seq_factory([1, 2, 3, 4, 9, 10, 11, 12])
-        assert not bm.can_allocate(s2)
+        assert bm.can_allocate(s2) < 0
 
 
 # ── Hash table cleanup ───────────────────────────────────────────────────
@@ -217,24 +256,26 @@ class TestCanAllocateWithPrefixCaching:
 class TestHashTableCleanup:
     def test_stale_hash_entries_evicted_on_reuse(self, seq_factory):
         """When a cached block is reused for a different hash, the old
-        hash_to_block_id entry should be cleaned up."""
+        content-hash entry should be cleaned up."""
         cfg = MockConfig(
             num_kvcache_blocks=2, kv_cache_block_size=4, enable_prefix_caching=True
         )
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
-        h1 = bm.blocks[s1.block_table[0]].hash
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        h1 = bm.kv.block(s1.block_table[0]).hash
         bm.deallocate(s1)
 
         # Allocate with completely different tokens — should overwrite blocks
         s2 = seq_factory([90, 91, 92, 93, 94, 95, 96, 97])
         bm.allocate(s2)
+        bm.hash_blocks(s2, s2.num_tokens - s2.num_cached_tokens)
         # Old hash should no longer point to a valid block
-        assert bm.hash_to_block_id.get(h1) != s2.block_table[0]
+        assert bm.kv.lookup(h1) != s2.block_table[0]
 
     def test_hash_table_bounded_growth(self, seq_factory):
-        """hash_to_block_id should not grow beyond num_kvcache_blocks."""
+        """The content index should not grow beyond num_kvcache_blocks."""
         cfg = MockConfig(
             num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -242,10 +283,11 @@ class TestHashTableCleanup:
         for i in range(20):
             tokens = list(range(i * 4, i * 4 + 4))
             seq = seq_factory(tokens)
-            if bm.can_allocate(seq):
-                bm.allocate(seq)
+            n = bm.can_allocate(seq)
+            if n >= 0:
+                bm.allocate(seq, n)
                 bm.deallocate(seq)
-        assert len(bm.hash_to_block_id) <= cfg.num_kvcache_blocks
+        assert bm.kv.num_indexed <= cfg.num_kvcache_blocks
 
 
 # ── can_append with multi-token decode (speculative decoding) ────────────
@@ -296,15 +338,18 @@ class TestPrefixCachingPreemption:
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
         # Simulate preemption
         bm.deallocate(s1)
         assert s1.num_cached_tokens == 0
         assert s1.block_table == []
 
-        # Re-allocate — should get cache hits on both blocks
+        # Re-allocate — first block is a cache hit; the last full block is
+        # force-recomputed so prefill has at least one token to forward.
         s1_retry = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        bm.allocate(s1_retry)
-        assert s1_retry.num_cached_tokens == 8  # both blocks cached
+        n = bm.can_allocate(s1_retry)
+        bm.allocate(s1_retry, n)
+        assert s1_retry.num_cached_tokens == 4
 
 
 # ── Edge cases ───────────────────────────────────────────────────────────
@@ -325,8 +370,9 @@ class TestPrefixCachingEdgeCases:
         # Partial block → hash is -1 → no caching
         assert s2.num_cached_tokens == 0
 
-    def test_exact_block_size_fully_cached(self, seq_factory):
-        """Sequence with exactly block_size tokens — fully cached on reuse."""
+    def test_exact_block_size_last_block_recomputed(self, seq_factory):
+        """Single-block prompt: last full block is force-recomputed on reuse so
+        prefill has at least one token to forward and produce logits."""
         cfg = MockConfig(
             num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -336,12 +382,131 @@ class TestPrefixCachingEdgeCases:
         bm.deallocate(s1)
         s2 = seq_factory([1, 2, 3, 4])
         bm.allocate(s2)
-        assert s2.num_cached_tokens == 4
+        assert s2.num_cached_tokens == 0
 
-    def test_free_block_ids_set_consistent(self, block_manager, seq_factory):
-        """free_block_ids_set stays consistent through allocate/deallocate."""
+    def test_free_count_consistent(self, block_manager, seq_factory):
+        """The free count stays consistent through allocate/deallocate."""
         s1 = seq_factory([1, 2, 3, 4])
         block_manager.allocate(s1)
-        initial_free = len(block_manager.free_block_ids_set)
+        initial_free = block_manager.kv.num_free
         block_manager.deallocate(s1)
-        assert len(block_manager.free_block_ids_set) == initial_free + 1
+        assert block_manager.kv.num_free == initial_free + 1
+
+
+# ── decode-side block hashing ──────────────────────────────────────────────
+
+
+class TestDecodeBlockHashing:
+    """Generated blocks must enter the prefix cache, not just prompt blocks.
+
+    The multi-turn case: turn 2's prompt is turn 1's prompt plus turn 1's
+    answer. Hashing only the prompt caps every follow-up hit at the original
+    prompt length, no matter how much of the conversation is still resident.
+    """
+
+    BS = 4
+
+    def _bm(self, **overrides):
+        cfg = {
+            "num_kvcache_blocks": 100,
+            "kv_cache_block_size": self.BS,
+            "enable_prefix_caching": True,
+            "max_model_len": 256,
+        }
+        cfg.update(overrides)
+        return BlockManager(MockConfig(**cfg))
+
+    def _run_turn(self, bm, seq, generated):
+        """Prefill `seq`, then append `generated` and hash what filled up."""
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens - seq.num_cached_tokens)
+        for token in generated:
+            seq.append_token(token)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+
+    def test_followup_turn_reuses_the_generated_blocks(self, seq_factory):
+        bm = self._bm()
+        prompt = list(range(8))  # 2 blocks
+        generated = list(range(100, 112))  # 3 more blocks
+        self._run_turn(bm, seq_factory(prompt), generated)
+
+        # Turn 2 replays the whole conversation as its prompt: 20 tokens, 5
+        # blocks. can_allocate never hands back the last block (the seq has to
+        # forward something), so a full hit is 4.
+        followup = seq_factory(prompt + generated)
+        assert bm.can_allocate(followup) == 4
+
+    def test_prompt_only_hashing_would_stop_at_the_prompt(self, seq_factory):
+        """Pins what the fix buys: without it the hit stops at 2 blocks."""
+        bm = self._bm()
+        prompt = list(range(8))
+        generated = list(range(100, 112))
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        for token in generated:
+            seq.append_token(token)
+            bm.may_append(seq)
+        # Deliberately skip hash_decode_blocks — the pre-fix behaviour.
+        followup = seq_factory(prompt + generated)
+        assert bm.can_allocate(followup) == 2
+
+    def test_uncommitted_tail_is_not_hashed(self, seq_factory):
+        """Only whole blocks below the committed watermark may be published.
+
+        The speculative-decoding hazard: tokens above the committed length can
+        still be rewritten next step, and their KV with them.
+        """
+        bm = self._bm()
+        prompt = list(range(8))
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        for token in range(100, 112):
+            seq.append_token(token)
+            bm.may_append(seq)
+        # Commit only the first generated block; the rest is still in flight.
+        bm.hash_decode_blocks(seq, 12)
+        assert seq.num_hashed_tokens == 12
+
+        followup = seq_factory(prompt + list(range(100, 112)))
+        assert bm.can_allocate(followup) == 3  # 2 prompt + 1 committed
+
+    def test_watermark_advances_past_the_prompt_boundary_block(self, seq_factory):
+        """The block straddling prompt-end is hashed once generation fills it."""
+        bm = self._bm()
+        prompt = list(range(10))  # 2 whole blocks + 2 tokens
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        assert seq.num_hashed_tokens == 8  # block 2 is half full
+
+        for token in range(100, 106):
+            seq.append_token(token)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+        assert seq.num_hashed_tokens == 16
+
+    def test_deallocate_clears_the_watermark(self, seq_factory):
+        bm = self._bm()
+        seq = seq_factory(list(range(8)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        assert seq.num_hashed_tokens == 8
+        bm.deallocate(seq)
+        # Preemption frees through here and re-prefills from scratch; a stale
+        # watermark would make hash_decode_blocks index a block table that no
+        # longer exists.
+        assert seq.num_hashed_tokens == 0
+
+    def test_no_op_without_prefix_caching(self, seq_factory):
+        bm = self._bm(enable_prefix_caching=False)
+        seq = seq_factory(list(range(8)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        for token in range(100, 108):
+            seq.append_token(token)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+        assert seq.num_hashed_tokens == 0
+        assert not bm.kv.num_indexed

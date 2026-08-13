@@ -14,10 +14,10 @@ black . && ruff check .                   # format + lint (CI enforced)
 
 ```bash
 # OpenAI-compatible serving
-python -m atom.entrypoints.openai_server --model <model> --kv_cache_dtype fp8 -tp 8
+python -m atom.entrypoints.openai_server --model <model> --kv-cache-dtype fp8 -tp 8
 
 # Offline inference
-python -m atom.examples.simple_inference --model <model> --kv_cache_dtype fp8
+python -m atom.examples.simple_inference --model <model> --kv-cache-dtype fp8
 ```
 
 - Accuracy validation: see `/ci-pr-guide` for `lm_eval` setup and CI thresholds
@@ -53,7 +53,7 @@ Key entry points:
 ## Key Development Patterns
 
 - **Adding a model**: see `/add-model` for full guide
-- **Model reuse**: DeepSeek V3/V3.2/GLM-5 share `deepseek_v2.py`; MTP models in `deepseek_mtp.py` and `qwen3_next_mtp.py`
+- **Model reuse**: DeepSeek V3/V3.2/GLM-5 share `deepseek_v2.py`; MTP models in `deepseek_mtp.py`, `qwen3_next_mtp.py`, and `qwen3_5_mtp.py`
 - **Compilation levels**: `--level` 0=eager, 1=torch.compile, 2=dynamo once, 3=piecewise+CUDAGraph (default)
 
 ## Dependencies

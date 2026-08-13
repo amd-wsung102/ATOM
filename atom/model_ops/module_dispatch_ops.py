@@ -1,0 +1,208 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Custom ops dispatching to module methods via `static_forward_context`.
+
+Each op below takes a `layer_name: str` and looks up the owning module from
+`compilation_config.static_forward_context[layer_name]`. The module's
+internal state (sub-modules, persistent buffers, per-fwd metadata fetched
+through `get_forward_context()`) stays out of the op's argument list, which:
+
+  - hides dynamic-shape internals from Dynamo / fake-tensor mode (no graph
+    break, no per-shape recompile)
+  - bypasses functionalization for buffer mutations — the buffers aren't in
+    the op's signature, so the pass needn't insert defensive clones
+  - leaves CUDAGraph capture transparent — the op still launches the same
+    CUDA work on the stream; only the Python dispatch is opaque to compile
+
+Caller contract (per op): the module registered at `layer_name` must expose
+the methods listed in each op's docstring.
+
+Currently registered:
+  - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4/K3 MoE
+  - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
+"""
+
+import torch
+
+from atom.config import CUDAGraphMode, get_current_atom_config
+from atom.utils import envs
+from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.forward_context import get_current_cudagraph_runtime_mode
+
+# ---------------------------------------------------------------------------
+# Dual-stream MoE dispatch (V2 / V3.2 / V4 / K3)
+# ---------------------------------------------------------------------------
+#
+# Caller contract (the MoE module looked up by `layer_name`):
+#   - `_use_dual_stream: bool`
+#   - `single_stream_moe_forward(hidden_states) -> Tensor`
+#   - `dual_stream_moe_forward(hidden_states) -> Tensor`
+#
+# Per-token gating: decode benefits from dual-stream, prefill doesn't —
+# threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`.
+
+
+def maybe_dual_stream_forward(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+    num_tokens = hidden_states.shape[0]
+    # Under TBO the two micro-batches already overlap on separate threads
+    from atom.utils.tbo.ubatching import tbo_active
+
+    # Graph ownership belongs to the active frontend.  Only a concrete
+    # PIECEWISE runtime decision is unsafe here: per-piece capture closes over
+    # the main stream while this forward forks work onto `alt_stream`.  Eager
+    # NONE and whole-model FULL capture both support the fork/join topology.
+    is_piecewise_cudagraph = (
+        get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
+    )
+
+    if (
+        self._use_dual_stream
+        and 0 < num_tokens <= threshold
+        and not tbo_active()
+        and not is_piecewise_cudagraph
+    ):
+        return self.dual_stream_moe_forward(hidden_states)
+    return self.single_stream_moe_forward(hidden_states)
+
+
+def _maybe_dual_stream_forward_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="maybe_dual_stream_forward",
+    op_func=maybe_dual_stream_forward,
+    # Op returns a fresh tensor; never writes into `hidden_states`. Declaring
+    # `mutates_args=["hidden_states"]` (the V2 original) misleads the
+    # functionalization pass into inserting defensive input clones.
+    mutates_args=(),
+    fake_impl=_maybe_dual_stream_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# ---------------------------------------------------------------------------
+# Sparse indexer score + top-k (V2/V3.2/V4)
+# ---------------------------------------------------------------------------
+#
+# Caller contract (the Indexer module looked up by `layer_name`):
+#   - `indexer_score_topk(q_quant, weights, q_scale, topk) -> Tensor`  — real impl,
+#     (q_quant is FP8, or packed FP4 uint8 when the FP4 indexer is on; q_scale is
+#     the paired e8m0 Q scale on the FP4 path, None for FP8)
+#     must return `[total_tokens, topk] int32` indices
+#
+# `topk` is on the op signature (not derived from the module) so the fake
+# impl can size the output without any module lookup.
+#
+# Other inputs (block_tables, KV cache, per-fwd metadata) are read by the
+# module from `self` or `get_forward_context().attn_metadata`.
+#
+# Why opaque (same rationale for V2 and V4):
+#   - prefill paths allocate scratch tensors with shapes that depend on
+#     per-fwd `total_committed` / `total_kv` — Dynamo's fake-tensor pass
+#     can't size them without a graph break.
+#   - decode paths write into module-owned buffers; keeping the buffers
+#     out of the op signature avoids functionalization clones.
+
+
+def indexer_score_topk(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    layer_name: str,
+    topk: int,
+) -> torch.Tensor:
+    indexer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return indexer.indexer_score_topk(q_quant, weights, q_scale, topk)
+
+
+def _indexer_score_topk_fake(
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    layer_name: str,
+    topk: int,
+) -> torch.Tensor:
+    return torch.empty(
+        (q_quant.shape[0], topk),
+        dtype=torch.int32,
+        device=q_quant.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="indexer_score_topk",
+    op_func=indexer_score_topk,
+    # Output is a fresh tensor (per module contract). Internal buffer
+    # mutations on the module are looked up via `layer_name`, not passed
+    # in, so functionalization stays unaware and skips defensive clones.
+    mutates_args=(),
+    fake_impl=_indexer_score_topk_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def tbo_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if not tbo_active():
+        return tensor_model_parallel_all_reduce(x)
+
+    # Default "inline": correct Plan-A baseline (no overlap, never hangs). Only
+    # move the AR onto the comm stream when explicitly opted into "overlap".
+    if envs.ATOM_TBO_TP_AR_MODE != "overlap":
+        return tensor_model_parallel_all_reduce(x)
+
+    from atom.utils.tbo.ubatching import (
+        tbo_current_ubatch_id,
+        tbo_get_comm_stream,
+        tbo_get_ubatch_tp_comm,
+        tbo_switch_to_compute_sync,
+        tbo_yield_and_switch_from_compute_to_comm,
+    )
+
+    ubatch_id = tbo_current_ubatch_id()
+
+    ub_comm = tbo_get_ubatch_tp_comm(ubatch_id)
+    if ub_comm is None:
+        # world_size == 1: nothing to reduce.
+        return x
+
+    # Hand the CPU baton to the partner ubatch and move onto the comm stream,
+    # so this AR overlaps the partner's compute.
+    tbo_yield_and_switch_from_compute_to_comm()
+    comm_stream = tbo_get_comm_stream()
+    # out-of-place all_reduce on this ubatch's dedicated communicator, launched
+    # on the comm stream (current stream after the switch above).
+    x = ub_comm.all_reduce(x, stream=comm_stream)
+
+    tbo_switch_to_compute_sync()
+    return x
+
+
+def _tbo_all_reduce_fake(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="tbo_all_reduce",
+    op_func=tbo_all_reduce,
+    mutates_args=(),
+    fake_impl=_tbo_all_reduce_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)

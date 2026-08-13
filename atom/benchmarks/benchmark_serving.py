@@ -28,20 +28,27 @@ On the client side, run:
 import argparse
 import asyncio
 import contextlib
+import functools
 import gc
 import json
 import os
 import random
 import time
 import warnings
-from argparse import ArgumentParser as FlexibleArgumentParser
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
+
+from atom.entrypoints.openai.chat_encoders import (
+    apply_chat_template,
+    load_custom_message_encoder,
+)
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 from .backend_request_func import (
     ASYNC_REQUEST_FUNCS,
@@ -63,6 +70,7 @@ class BenchmarkMetrics:
     request_goodput: float
     output_throughput: float
     total_token_throughput: float
+    concurrency: float
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
@@ -92,16 +100,15 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     use_chat_template: bool = False,
+    apply_chat_template_fn: Callable = lambda x: x,
 ) -> List[Tuple[str, int, int]]:
     prefix_token_ids = np.random.randint(
         0, tokenizer.vocab_size, size=prefix_len
     ).tolist()
 
     if use_chat_template:
-        chat_template_dummy = tokenizer.apply_chat_template(
+        chat_template_dummy = apply_chat_template_fn(
             [{"role": "user", "content": "a"}],
-            add_generation_prompt=True,
-            tokenize=False,
         )
         tokenized_chat_template_dummy = tokenizer.encode(
             chat_template_dummy, add_special_tokens=False
@@ -143,10 +150,8 @@ def sample_random_requests(
             prompt = tokenizer.decode(prompt_token_ids)
 
         if use_chat_template:
-            prompt = tokenizer.apply_chat_template(
+            prompt = apply_chat_template_fn(
                 [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
             )
 
         prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
@@ -306,6 +311,9 @@ def calculate_metrics(
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
+        # Average number of requests in flight = sum of per-request end-to-end
+        # latencies divided by the wall-clock benchmark duration.
+        concurrency=sum(e2els) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         std_ttft_ms=np.std(ttfts or 0) * 1000,
@@ -334,6 +342,29 @@ def calculate_metrics(
     )
 
     return metrics, actual_output_lens
+
+
+async def get_spec_stats(base_url: str) -> Optional[dict]:
+    """Fetch speculative-decoding statistics from the ATOM server.
+
+    Returns the ``/debug/mtp_stats`` payload (which includes
+    ``average_tokens_per_forward`` = accept length = 1 + accepted draft tokens,
+    and ``acceptance_rate`` = accepted / drafted), or ``None`` when speculative
+    decoding is disabled or the endpoint is unavailable. The values are
+    cumulative since server start; for a per-config fresh server (the CI
+    benchmark flow) that is effectively this run.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{base_url}/debug/mtp_stats") as resp:
+                if resp.status != 200:
+                    return None
+                stats = await resp.json()
+    except Exception:
+        return None
+    if not stats.get("enabled"):
+        return None
+    return stats
 
 
 async def benchmark(
@@ -515,6 +546,10 @@ async def benchmark(
         goodput_config_dict=goodput_config_dict,
     )
 
+    spec_stats = await get_spec_stats(base_url)
+    accept_length = spec_stats.get("average_tokens_per_forward") if spec_stats else None
+    acceptance_rate = spec_stats.get("acceptance_rate") if spec_stats else None
+
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
@@ -541,6 +576,11 @@ async def benchmark(
             "Total Token throughput (tok/s):", metrics.total_token_throughput
         )
     )
+    print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
+    if accept_length:
+        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if acceptance_rate is not None:
+        print("{:<40} {:<10.2f}".format("Acceptance rate (%):", acceptance_rate * 100))
 
     result = {
         "duration": benchmark_duration,
@@ -551,6 +591,9 @@ async def benchmark(
         "request_goodput:": metrics.request_goodput if goodput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
+        "concurrency": metrics.concurrency,
+        "accept_length": accept_length,
+        "acceptance_rate": acceptance_rate,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
@@ -683,6 +726,14 @@ def save_to_pytorch_benchmark_format(
 
 
 def main(args: argparse.Namespace):
+    # Raise the open-file soft limit before opening any connections. At high
+    # --max-concurrency each in-flight request is a socket (fd); the default
+    # RLIMIT_NOFILE soft (~1024) is exhausted client-side (EMFILE on socket()),
+    # silently dropping requests so most never reach the server. The server
+    # already calls set_ulimit() at startup; the client must too.
+    from atom.utils import set_ulimit
+
+    set_ulimit()
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -705,6 +756,10 @@ def main(args: argparse.Namespace):
         tokenizer_mode=tokenizer_mode,
         trust_remote_code=args.trust_remote_code,
     )
+    custom_encoder = load_custom_message_encoder(model_id)
+    apply_chat_template_fn = functools.partial(
+        apply_chat_template, tokenizer, custom_encoder
+    )
 
     if args.dataset_name == "random":
         input_requests = sample_random_requests(
@@ -714,6 +769,7 @@ def main(args: argparse.Namespace):
             num_prompts=args.num_prompts,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
+            apply_chat_template_fn=apply_chat_template_fn,
             use_chat_template=args.use_chat_template,
         )
 

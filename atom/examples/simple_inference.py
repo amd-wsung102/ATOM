@@ -4,10 +4,15 @@
 import argparse
 
 from atom import SamplingParams
+from atom.entrypoints.openai.chat_encoders import (
+    apply_chat_template,
+    load_custom_message_encoder,
+)
 from atom.model_engine.arg_utils import EngineArgs
+from atom.utils.arg_parser import FlexibleArgumentParser
 from transformers import AutoTokenizer
 
-parser = argparse.ArgumentParser(
+parser = FlexibleArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config of test",
 )
@@ -18,6 +23,12 @@ EngineArgs.add_cli_args(parser)
 # Add example-specific arguments
 parser.add_argument(
     "--temperature", type=float, default=0.6, help="temperature for sampling"
+)
+parser.add_argument(
+    "--max-tokens",
+    type=int,
+    default=300,
+    help="max sampled tokens per prompt",
 )
 
 
@@ -37,6 +48,8 @@ def main():
         "list all prime numbers within 100",
         "1+2+3=?",
         "如何在一个月内增肌10公斤",
+        "+".join([f"{i}-{i+1}" for i in range(1000)]) + "=? 最后结果是什么",
+        "+".join([f"{i}+{i+1}" for i in range(1500)]) + "=? 最后结果是什么",
     ]
     args = parser.parse_args()
     # Generate power of 2 sizes for CUDA graph: [1, 2, 4, 8, ...]
@@ -48,16 +61,14 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=256)
+    sampling_params = SamplingParams(
+        temperature=args.temperature, max_tokens=args.max_tokens
+    )
 
+    custom_encoder = load_custom_message_encoder(args.model)
     prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
-        )
-        for prompt in prompts
+        apply_chat_template(tokenizer, custom_encoder, [{"role": "user", "content": p}])
+        for p in prompts
     ]
     print("This is prompts:", prompts)
     # print("Warming up...")

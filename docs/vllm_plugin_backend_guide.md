@@ -1,11 +1,11 @@
-# ATOM vLLM Plugin Backend
+# vLLM-ATOM backend
 
-ATOM can work as the vLLM out-of-tree (OOT) plugin backend — installed as a separate Python package and plugged into vLLM through vLLM's official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.
+ATOM can work as the vLLM-ATOM out-of-tree (OOT) backend — installed as a separate Python package and plugged into vLLM through vLLM's official plugin interfaces. This keeps the integration clean while letting ATOM reuse the mature serving and runtime features already provided by vLLM.
 
 This integration follows the direction described in the [RFC to enable ATOM as a vLLM out-of-tree platform](https://github.com/ROCm/ATOM/issues/201). The high-level idea is that vLLM remains the framework-level runtime, while ATOM focuses on model-level and kernel-level optimization for AMD GPUs. In this mode, ATOM serves as the optimized execution backend and an incubation layer for new kernels, fusions, and model implementations before they are mature enough to be upstreamed.
 
-## 1. Architecture
-### 1.1 Design overview
+## Architecture
+### Design overview
 In practice, the responsibilities are split as follows:
 
 | Layer | Responsibility |
@@ -16,7 +16,7 @@ In practice, the responsibilities are split as follows:
 
 This relationship is important: ATOM is not replacing vLLM as a serving framework. Instead, ATOM plugs optimized model execution components into the extension points that vLLM already exposes.
 
-### 1.2 How it works
+### How it works
 When the `atom` package is installed in the same Python environment as `vllm`, two entry points are exposed following the official vLLM plugin convention:
 
 ```toml
@@ -35,9 +35,9 @@ During `vllm serve` startup, vLLM scans installed Python packages, loads these e
 - When a supported model is instantiated, the ATOM wrapper creates the ATOM plugin config, initializes the ATOM/AITER runtime state, and constructs the ATOM model implementation.
 - vLLM continues to drive request scheduling and serving, while the hot model execution path runs through ATOM model code, ATOM attention backends, and AITER-backed kernels.
 
-### 1.3 Plugin lifecycle
+### Plugin lifecycle
 
-```
+```text
 vLLM startup
 │
 ├─ 1. register_platform()
@@ -45,69 +45,61 @@ vLLM startup
 │     └─ return "atom.plugin.vllm.platform.ATOMPlatform"
 │
 ├─ 2. register_model()
-│     ├─ Override ModelRegistry for supported architectures
-│     ├─ patch_vllm_mla_attention()
-│     └─ Patch Attention.process_weights_after_loading
+│     └─ Override ModelRegistry for supported architectures
 │
 ├─ 3. vLLM loads model → ATOMModelBase.__init__()
 │     ├─ generate_atom_config_for_plugin_mode(vllm_config)
 │     │     └─ _generate_atom_config_from_vllm_config()
 │     │           ├─ Build PluginConfig (vLLM-specific fields)
 │     │           └─ Build ATOM Config (model, TP, KV cache, etc.)
-│     ├─ set_attn_cls() → ops.Attention = PagedAttention
+│     ├─ Attention dispatcher selects AttentionForVllm
 │     ├─ init_aiter_dist() → initialize AITER distributed env
 │     └─ Construct ATOM model (e.g., DeepseekV3ForCausalLM)
 │
-├─ 4. ATOMPlatform.get_attn_backend_cls()
-│     ├─ MLA model → AiterMLABackend
-│     └─ MHA model → AiterBackend
+├─ 4. AttentionForVllm layer construction
+│     ├─ MLA model → AiterMlaBackendForVllm
+│     └─ MHA model → AiterMhaBackendForVllm
 │
 └─ 5. Forward pass
       ├─ vLLM calls ATOMModelBase.forward()
       ├─ Delegates to self.model(input_ids, positions, ...)
-      └─ Attention uses ATOM's AITER kernels via plugin decorators
+      └─ AttentionForVllm uses ATOM's AITER kernels
 ```
 
-### 1.4 Key Modules
+### Key modules
 
 | Module | Purpose |
 |---|---|
 | `atom.plugin.vllm.register` | vLLM plugin entry points for platform and model registration |
 | `atom.plugin.vllm.platform` | The ATOM platform class exposed to vLLM |
 | `atom.plugin.vllm.model_wrapper` | ATOM model wrappers used by vLLM model construction |
-| `atom.model_ops.attentions.aiter_attention` | ATOM MHA attention backend for vLLM plugin mode |
-| `atom.model_ops.attentions.aiter_mla` | ATOM MLA attention backend for vLLM plugin mode |
+| `atom.plugin.vllm.attention` | vLLM-specific ATOM attention layers, backends, metadata, and impls |
 
-### 1.5 Component Diagram
+### Component diagram
 
-```
+```text
 atom/plugin/
 ├── __init__.py              # Public API: is_vllm, is_plugin_mode
 ├── prepare.py               # Framework detection and state management
 ├── config.py                # PluginConfig + vLLM-to-ATOM config translation
 ├── register.py              # set_attn_cls, init_aiter_dist
-├── attention.py             # vLLM attention metadata builders and backend decorators
-├── attention_mha.py         # MHA (PagedAttention) plugin-mode decorator
-├── attention_mla.py         # MLA plugin-mode methods and decorator
-├── moe.py                   # FusedMoE decorator for plugin mode
 └── vllm/
     ├── __init__.py           # vLLM sub-package exports
     ├── register.py           # register_platform(), register_model()
     ├── platform.py           # ATOMPlatform (RocmPlatform subclass)
     ├── model_wrapper.py      # ATOMModelBase, ATOMForCausalLM, ATOMMoEForCausalLM
-    └── mla_patch.py          # Patches vLLM MLAAttention for ATOM MLA integration
+    ├── moe.py                # vLLM-specific FusedMoE name adaptation
+    └── attention/            # vLLM-specific ATOM attention stack
 ```
 
----
-
-## 2. Configuration Translation
+## Configuration translation
 
 When vLLM constructs an ATOM model, `generate_atom_config_for_plugin_mode()` translates
 vLLM's `VllmConfig` into an ATOM `Config`. The translation preserves vLLM's
 scheduling, caching, and parallelism decisions while injecting ATOM-specific
 compilation and plugin settings.
 
-### 2.1 `PluginConfig` Fields
+### `PluginConfig` fields
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -118,9 +110,8 @@ compilation and plugin settings.
 | `vllm_scheduler_config` | `Any` | `None` | vLLM scheduler config |
 | `vllm_cache_config` | `Any` | `None` | vLLM cache config |
 | `vllm_quant_config` | `Any` | `None` | vLLM quantization config |
-| `vllm_use_atom_attention` | `bool` | `False` | Whether ATOM attention is active |
 
-### 2.2 vLLM Config Mapping
+### vLLM config mapping
 
 The following table shows how vLLM config fields map to ATOM `Config` fields:
 
@@ -164,31 +155,27 @@ The following table shows how vLLM config fields map to ATOM `Config` fields:
   strategy is defined in ATOM's `split_graph()` / `_split_judge_func()` and is
   independent of vLLM's compilation backend.
 
----
+## Attention integration
 
-## 3. Attention Integration
+ATOM's vLLM plugin constructs ATOM-owned attention layers directly from the
+ATOM model implementation. These layers implement vLLM's `AttentionLayerBase`
+contract and return their ATOM-vLLM backend via `get_attn_backend()`.
 
-vLLM's OOT plugin interface allows an external platform to supply its own
-attention backend. ATOM hooks into this by overriding
-`ATOMPlatform.get_attn_backend_cls()` — the only contract point between vLLM and
-the plugin for attention dispatch.
+### How the backend is selected
 
-### 3.1 How the Backend Is Selected
-
-When vLLM resolves the attention backend for a model, it calls the platform's
-`get_attn_backend_cls()`. ATOM's implementation returns one of two backends based
-on the model's attention type:
+When vLLM discovers attention-like layers through `static_forward_context`, each
+ATOM-vLLM attention layer returns its backend based on the model's attention type:
 
 | Model Attention Type | Returned Backend | Example Models |
 |---|---|---|
-| MLA (`use_mla == True`) | `AiterMLABackend` | DeepSeek-R1, Kimi-K2 |
-| Standard MHA | `AiterBackend` | Qwen3, Llama |
+| MLA (`use_mla == True`) | `AiterMlaBackendForVllm` | DeepSeek-R1, Kimi-K2 |
+| Standard MHA | `AiterMhaBackendForVllm` | Qwen3, Llama |
 
-Setting `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1` causes `ATOMPlatform` to delegate
-back to the parent `RocmPlatform.get_attn_backend_cls()`, restoring vLLM's
-built-in ROCm attention path.
+ATOM-vLLM no longer constructs vLLM's standard `Attention` / `MLAAttention`, so
+there is no supported mode to disable only ATOM attention while keeping ATOM
+models active. Use `ATOM_DISABLE_VLLM_PLUGIN=1` for pure vLLM.
 
-## 4. Supported Models
+## Supported models
 Currently, the plugin backend supports the following model architectures:
 
 | HF architecture | ATOM model implementation | Model family example |
@@ -198,18 +185,22 @@ Currently, the plugin backend supports the following model architectures:
 | `GptOssForCausalLM` | `atom.models.gpt_oss.GptOssForCausalLM` | GPT-OSS |
 | `DeepseekV3ForCausalLM` | `atom.models.deepseek_v2.DeepseekV3ForCausalLM` | DeepSeek-R1 / DeepSeek V3 / Kimi-K2 style models |
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe.Glm4MoeForCausalLM` | GLM-4-MoE |
+| `KimiK3ForConditionalGeneration` | `atom.plugin.vllm.models.kimi_k3.KimiK3ForCausalLM` | Kimi-K3 text-only KDA + MLA hybrid MoE |
 
 `Kimi-K2` is also supported. Although it is usually loaded with `--trust-remote-code`, it shares the same DeepSeek-style MLA+MoE architecture path and reuses `atom.models.deepseek_v2.DeepseekV3ForCausalLM` in the ATOM vLLM OOT backend.
 
----
+Kimi-K3 uses vLLM's hybrid/Mamba cache contract for KDA recurrent state and
+ATOM's MLA backend for full-attention layers. See the
+[Kimi-K3 vLLM recipe](../recipes/atom_vllm/Kimi-K3.md) for its TP8, FLA,
+prefix-caching, and text-only requirements.
 
-## 5. Installation and Quick Start
+## Installation and quick start
 
-### 5.1 Prerequisites
+### Prerequisites
 
 - AMD Instinct MI300X / MI300A / MI355X GPUs
 
-### 5.2 Set Up the Environment
+### Set up the environment
 
 The recommended approach is to pull an official ATOM + vLLM Docker image from
 [Docker Hub](https://hub.docker.com/r/rocm/atom-dev/tags?name=vllm). These
@@ -228,9 +219,9 @@ If you need an OOT docker image for a specific vLLM version or a specific releas
 docker pull rocm/atom-dev:vllm-v0.17.0-nightly_20260315
 ```
 
-### 5.3 Launch vLLM with ATOM Plugin
+### Launch vLLM with ATOM plugin
 
-The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options, OpenAI-compatible API usage, and client patterns, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
+The vLLM-ATOM backend keeps the standard vLLM CLI, server APIs, and general usage flow compatible with upstream vLLM. For general server options, OpenAI-compatible API usage, and client patterns, refer to the [official vLLM documentation](https://docs.vllm.ai/en/latest/).
 
 ```bash
 vllm serve ${model} \
@@ -248,12 +239,12 @@ vllm serve ${model} \
 
 ATOM will log its activation at startup:
 
-```
+```text
 INFO atom: Register model DeepseekV3ForCausalLM to vLLM with atom.plugin.vllm.model_wrapper:ATOMMoEForCausalLM
 INFO atom: Use atom attention backend
 ```
 
-### 5.4 Benchmark Serving
+### Benchmark serving
 Users can use the default vllm bench commands for performance benchmarking.
 ```bash
 vllm bench serve \
@@ -269,7 +260,7 @@ vllm bench serve \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
-### 5.5 Enable Profiling
+### Enable profiling
 
 If you want to collect profiles, add the recommended commands by vLLM with `--profiler-config "$profiler_config"`.
 
@@ -281,7 +272,7 @@ profiler_config=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","torch_p
 ```
 
 
-### 5.6 Disable ATOM Plugin
+### Disable ATOM plugin
 
 This is intended for **debugging only**. When the ATOM plugin is disabled, vLLM
 falls back to its built-in ROCm path, which may encounter version mismatches
@@ -292,16 +283,24 @@ set environment variables before launching:
 # Disable the entire ATOM plugin (platform + models)
 export ATOM_DISABLE_VLLM_PLUGIN=1
 
-# Or disable only ATOM attention (keep ATOM models but use vLLM attention)
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
 ```
 
----
-
-## 6. Environment Variables
+## Environment variables
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `ATOM_DISABLE_VLLM_PLUGIN` | bool | `0` (false) | Set to `1` to disable the entire ATOM vLLM plugin (platform + model registration). vLLM runs in pure ROCm mode. |
-| `ATOM_DISABLE_VLLM_PLUGIN_ATTENTION` | bool | `0` (false) | Set to `1` to disable only ATOM's attention backends. ATOM models are still used, but attention falls back to vLLM's default ROCm backend. |
-| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion in attention. Recommended for Qwen3-MoE models. |
+| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models. |
+
+### Online quantization
+
+Online (load-time) quantization is supported in plugin mode. Since `vllm serve`
+cannot take ATOM's `--online_quant_config` CLI flag, pass the same JSON through
+vLLM's `--additional-config` under the `online_quant_config` key:
+
+```bash
+vllm serve <model> ... \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*expert*": "mxfp4"}, "exclude_layer": ["lm_head", "*.gate.*"]}}'
+```
+
+See the [online quantization guide](online_quantization_guide.md#plugin-mode-vllm-serve) for the full schema.
