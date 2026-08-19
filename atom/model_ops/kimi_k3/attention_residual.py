@@ -34,8 +34,11 @@ Four deliberate divergences from that reference:
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 
@@ -191,6 +194,20 @@ def _pick_attn_res_config(tokens: int):
     return _ATTN_RES_CATCHALL
 
 
+@lru_cache(maxsize=1)
+def _flydsl_impl():
+    """The FlyDSL drop-in for this kernel, or None when flydsl is missing.
+
+    Imported lazily: flydsl is an optional dependency, and importing it builds
+    MLIR bindings that a Triton-only deployment should not pay for.
+    """
+    try:
+        from atom.model_ops.kimi_k3 import attention_residual_flydsl
+    except ImportError:
+        return None
+    return attention_residual_flydsl
+
+
 def _apply_attn_res_impl(
     prefix_sum: torch.Tensor,  # [T, H]
     block_residual: torch.Tensor,  # [T, B, H]
@@ -218,7 +235,36 @@ def _apply_attn_res_impl(
     When ``out_norm_weight`` is given, the caller's rmsnorm OF THE RESULT (every
     apply_attn_res call site in kimi_k3.py feeds one) is folded in too, so the
     returned ``y`` is already normed and scaled.
+
+    ``ATOM_ATTN_RES_USE_FLYDSL`` selects between this Triton kernel and the
+    FlyDSL one in ``attention_residual_flydsl``; both return the same thing.
     """
+    # The branch sits inside the custom op, so the op boundary, its fake impl
+    # and Dynamo's view of it are the same either way.
+    flydsl_mode = envs.ATOM_ATTN_RES_USE_FLYDSL
+    if flydsl_mode != "never":
+        flydsl = _flydsl_impl()
+        supported = flydsl is not None and flydsl.flydsl_attn_res_supported(
+            prefix_sum, block_residual, score_weight, out_norm_weight
+        )
+        if supported:
+            return flydsl.flydsl_apply_attn_res(
+                prefix_sum,
+                block_residual,
+                score_weight,
+                eps,
+                add_hidden,
+                out_norm_weight,
+                out_eps,
+                add_hidden2,
+            )
+        if flydsl_mode == "always":
+            raise RuntimeError(
+                "ATOM_ATTN_RES_USE_FLYDSL=always but the FlyDSL kernel cannot "
+                f"serve this call (flydsl installed={flydsl is not None}, "
+                f"H={block_residual.shape[-1]}, dtype={prefix_sum.dtype})"
+            )
+
     T, B, H = block_residual.shape
     Bp = B + 1
     do_add = add_hidden is not None

@@ -75,6 +75,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # attn_res (Kimi-K3 attention residuals): switch between Triton and a
+    # flydsl drop-in. "auto" picks flydsl when the hidden size tiles exactly
+    # across a workgroup (any H divisible by 512 does, including K3's 7168) and
+    # the dtypes are supported; "always" forces it (errors on unsupported);
+    # "never" pins Triton. flydsl is 1.28x on the traced K3 workload -- 1.4-1.7x
+    # over the prefill token counts, 1.0-1.2x in decode, no case below parity.
+    "ATOM_ATTN_RES_USE_FLYDSL": lambda: os.getenv(
+        "ATOM_ATTN_RES_USE_FLYDSL", "auto"
+    ).lower(),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
